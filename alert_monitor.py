@@ -173,8 +173,7 @@ def push_alerts(alerts):
                     if stripped and not stripped.startswith("📊") and not stripped.startswith("🎯") and not stripped.startswith("⚠️"):
                         start = i
                         break
-                short_text = "\n".join(lines[start:]).strip()
-                short_reply = short_text[:150] if short_text else text[:150]
+                short_reply = "\n".join(lines[start:]).strip() or text
                 extra_text += f"\n📊 {coin_name} 简析: {short_reply}"
         except Exception as e:
             log(f"分析 {coin_name} 失败: {e}")
