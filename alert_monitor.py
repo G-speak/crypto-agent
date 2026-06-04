@@ -162,9 +162,9 @@ def push_alerts(alerts):
             data, _ = analyze_symbol(coin_name, next(s for c,s in WATCHLIST if c == coin_name))
             if "error" not in data:
                 prompt = build_prompt(data)
-                short_prompt = "请用1-2句话简要分析这个币种的行情，包括价格、RSI和操作建议。控制在80字内。\n\n" + prompt
+                short_prompt = "请用1-2句话简要分析这个币种的行情数据，只给出价格趋势判断和技术面结论，不要输出操作建议、参考价位、止损、风险提示等内容。控制在80字内。\n\n" + prompt
                 reply = ask_ai(short_prompt, model="deepseek-chat")
-                # 跳过标题行（📊🎯⚠️开头），取实际分析内容
+                # 跳过AI输出的固定标题行（📊🎯⚠️开头），取实际分析内容
                 text = reply.strip()
                 lines = text.split("\n")
                 start = 0
@@ -231,11 +231,13 @@ def push_alerts(alerts):
         except Exception as e:
             log(f"新闻搜索异常: {e}")
 
-    # 推送: 预警 + AI简析 + 消息面
+    # 推送: 预警 + AI简析 + 消息面 + 固定话术
+    DISCLAIMER = "\n\n⚠️ 风险提示\n以上分析不构成投资建议，请自行判断风险。"
     for i in range(0, len(alerts), 5):
         msg = "🔔 实时监控\n" + "\n\n".join(alerts[i:i+5])
         if extra_text:
             msg += "\n" + "-" * 20 + extra_text
+        msg += DISCLAIMER
         try:
             send_simple_message(msg)
             log(f"已推送 {len(alerts[i:i+5])} 条预警 (含AI分析+消息面)")
