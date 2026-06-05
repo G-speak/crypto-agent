@@ -211,15 +211,26 @@ def push_alerts(alerts):
                 news_resp = _req.post(
                     "https://api.aihubmix.com/v1/chat/completions",
                     headers=news_headers,
-                    json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": f"请搜索{coin_name}今天的最新新闻，列出最重要的2-3条，每条用一句话概括（含来源）。总字数控制在300字以内。"}]},
+                    json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": f"请搜索{coin_name}今天的最新新闻，列出最重要的2-3条，每条用一句话概括（含来源）。总字数控制在300字以内。注意：如果{coin_name}没有专属新闻，请说没有相关新闻，不要用大盘行情来填充。"}]},
                     timeout=25
                 )
                 if news_resp.status_code == 200:
                     news_text = news_resp.json()["choices"][0]["message"]["content"].replace("**", "")
-                    _news_cache[cache_key] = {"text": news_text, "time": time.time()}
-                    with open(_news_cache_file, "w") as _f:
-                        json.dump(_news_cache, _f)
-                    log(f"已搜索并缓存{coin_name}的新闻")
+                    # 验证：新闻内容必须包含币种名，否则认为是无效的填充
+                    if coin_name.upper() not in news_text.upper() and coin_name.lower() not in news_text.lower():
+                        log(f"{coin_name}新闻不包含币种名，丢弃")
+                        news_text = ""
+                    if news_text:
+                        _news_cache[cache_key] = {"text": news_text, "time": time.time()}
+                        with open(_news_cache_file, "w") as _f:
+                            json.dump(_news_cache, _f)
+                        log(f"已搜索并缓存{coin_name}的新闻")
+                    else:
+                        # 空内容也缓存，避免重复搜索
+                        _news_cache[cache_key] = {"text": "", "time": time.time()}
+                        with open(_news_cache_file, "w") as _f:
+                            json.dump(_news_cache, _f)
+                        log(f"{coin_name}无有效新闻，已记录缓存")
                 else:
                     log(f"{coin_name}新闻搜索失败: {news_resp.status_code}")
             except Exception as e:
