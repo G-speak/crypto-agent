@@ -140,9 +140,7 @@ def push_analysis(analysis_texts, chart_paths, touser=TOUSER):
 
 
 def send_simple_message(content, touser=TOUSER):
-    """快速发送一条文本消息 (自动加上时间戳)"""
-    now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
-    content = f"⏰ {now_str}\n{content}"
+    """快速发送一条文本消息"""
     try:
         token = get_token()
         send_text(token, content, touser)

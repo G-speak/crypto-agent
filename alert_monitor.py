@@ -202,6 +202,9 @@ def push_alerts(alerts):
             cached = _news_cache[cache_key].get("text", "")
             if cached:
                 news_text = cached.replace("**", "")
+                log(f"{coin_name}使用缓存新闻")
+            else:
+                log(f"{coin_name}缓存存在但内容为空，不搜索")
         else:
             try:
                 from wechat_config import AI_API_KEY
@@ -215,7 +218,7 @@ def push_alerts(alerts):
                 news_resp = _req.post(
                     "https://api.aihubmix.com/v1/chat/completions",
                     headers=news_headers,
-                    json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": f"请搜索{coin_name}今天的最新新闻，列出2-3条最重要的具体事件（含来源）。"}]},
+                    json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": f"请搜索{coin_name}今天的最新新闻，列出最重要的2-3条，每条用一句话概括（含来源）。总字数控制在300字以内。"}]},
                     timeout=25
                 )
                 if news_resp.status_code == 200:
