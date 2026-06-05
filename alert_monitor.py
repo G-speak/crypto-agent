@@ -137,49 +137,28 @@ def check_alerts():
 def push_alerts(alerts):
     if not alerts:
         return
-    from crypto_monitor import build_prompt, ask_ai
+    from crypto_monitor import analyze_symbol, ask_ai
     from wechat_push import send_simple_message
     import requests as _req, json as _json
-    
-    # 提取触发了预警的币种名
-    triggered_coins = set()
-    for a in alerts:
-        for coin_name in MAJOR_COINS:
-            if coin_name in a:
-                triggered_coins.add(coin_name)
-                break
-    from crypto_monitor import WATCHLIST
-    for c_name, _ in WATCHLIST:
-        for a in alerts:
-            if c_name in a:
-                triggered_coins.add(c_name)
-    
-    extra_text = ""
-# 为每个预警币种生成简短AI分析
-    for coin_name in triggered_coins:
-        try:
-            from crypto_monitor import analyze_symbol
-            data, _ = analyze_symbol(coin_name, next(s for c,s in WATCHLIST if c == coin_name))
-            if "error" not in data:
-                prompt = build_prompt(data)
-                short_prompt = "请用1-2句话简要分析这个币种的行情数据，只给出价格趋势判断和技术面结论，不要输出操作建议、参考价位、止损、风险提示等内容。控制在80字内。\n\n" + prompt
-                reply = ask_ai(short_prompt, model="deepseek-chat")
-                # 跳过AI输出的固定标题行（📊🎯⚠️开头），取实际分析内容
-                text = reply.strip()
-                lines = text.split("\n")
-                start = 0
-                for i, line in enumerate(lines):
-                    stripped = line.strip()
-                    if stripped and not stripped.startswith("📊") and not stripped.startswith("🎯") and not stripped.startswith("⚠️"):
-                        start = i
-                        break
-                short_reply = "\n".join(lines[start:]).strip() or text
-                extra_text += f"\n📊 {coin_name} 简析: {short_reply}"
-        except Exception as e:
-            log(f"分析 {coin_name} 失败: {e}")
-        
 
-    # 新闻搜索：按币种+按天缓存，每个币今天只搜一次
+    from crypto_monitor import WATCHLIST
+    
+    # 按币种分组预警
+    coin_alerts = {}  # coin_name -> [alert_lines]
+    for a in alerts:
+        matched = None
+        for c_name, _ in WATCHLIST:
+            if c_name in a:
+                matched = c_name
+                break
+        if matched:
+            coin_alerts.setdefault(matched, []).append(a)
+        else:
+            # 找不到币种的预警单独发
+            coin_alerts.setdefault("__other__", []).append(a)
+
+    # 今天日期缓存
+    _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
     _news_cache_file = os.path.expanduser("~/.hermes/news_cache.json")
     _news_cache = {}
     if os.path.exists(_news_cache_file):
@@ -188,62 +167,94 @@ def push_alerts(alerts):
                 _news_cache = json.load(_f)
         except:
             pass
-    _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
-    # 找出今天还没搜过的币
-    coins_to_search = []
-    for coin in triggered_coins:
-        cache_key = f"news_{coin}_{_today}"
-        if cache_key not in _news_cache:
-            coins_to_search.append(coin)
-        else:
+
+    DISCLAIMER = "\n\n⚠️ 风险提示\n以上分析不构成投资建议，请自行判断风险。"
+
+    for coin_name, coin_alert_list in coin_alerts.items():
+        if coin_name == "__other__":
+            msg = "🔔 实时监控\n\n" + "\n\n".join(coin_alert_list)
+            msg += DISCLAIMER
+            try:
+                send_simple_message(msg)
+                log(f"已推送 {len(coin_alert_list)} 条其他预警")
+                time.sleep(1)
+            except Exception as e:
+                log(f"推送失败: {e}")
+            continue
+
+        # 精简短分析：调用一次 AI 分析该币种
+        analysis_text = ""
+        try:
+            coin_symbol = next(s for c, s in WATCHLIST if c == coin_name)
+            data, _ = analyze_symbol(coin_name, coin_symbol)
+            if "error" not in data:
+                short_prompt = (
+                    f"现在{coin_name}价格${data['price']:.2f}，RSI {data['rsi']}。"
+                    f"请用1-2句话简要分析行情并给出操作建议，控制在80字内。"
+                )
+                reply = ask_ai(short_prompt, model="deepseek-chat")
+                # 去掉可能的标题前缀，只取纯文本
+                lines = reply.strip().split("\n")
+                clean_lines = [l for l in lines if l.strip() and not l.strip().startswith("📊") and not l.strip().startswith("🎯") and not l.strip().startswith("⚠️")]
+                analysis_text = " ".join(clean_lines) if clean_lines else reply.strip()
+        except Exception as e:
+            log(f"分析 {coin_name} 失败: {e}")
+
+        # 新闻（按币种缓存，一天一次）
+        news_text = ""
+        cache_key = f"news_{coin_name}_{_today}"
+        if cache_key in _news_cache:
             cached = _news_cache[cache_key].get("text", "")
             if cached:
-                clean_cached = cached.replace("**", "")
-                extra_text += f"\n\n📰 {coin} 消息面:\n{clean_cached}"
-    if coins_to_search:
-        try:
-            from wechat_config import AI_API_KEY
-            APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
-            coin_names = "、".join(coins_to_search)
-            news_prompt = f"现在是2026年6月。请搜索{coin_names}和加密货币市场今天的最新新闻，列出2-3条最重要的具体事件（含来源）。必须搜索实时新闻。"
-            news_headers = {
-                "Authorization": f"Bearer {AI_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            if APP_CODE:
-                news_headers["APP-Code"] = APP_CODE
-            news_resp = _req.post(
-                "https://api.aihubmix.com/v1/chat/completions",
-                headers=news_headers,
-                json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": news_prompt}]},
-                timeout=25
-            )
-            if news_resp.status_code == 200:
-                news = news_resp.json()["choices"][0]["message"]["content"]
-                clean_news = news.replace("**", "")
-                extra_text += f"\n\n📰 {coin_names} 消息面:\n{clean_news}"
-                _news_cache[f"news_{coin}_{_today}"] = {"text": news, "time": time.time()}
-                with open(_news_cache_file, "w") as _f:
-                    json.dump(_news_cache, _f)
-                log(f"已搜索并缓存{coin_names}的新闻")
-            else:
-                log(f"新闻搜索失败: {news_resp.status_code}")
-        except Exception as e:
-            log(f"新闻搜索异常: {e}")
+                news_text = cached.replace("**", "")
+        else:
+            try:
+                from wechat_config import AI_API_KEY
+                APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
+                news_headers = {
+                    "Authorization": f"Bearer {AI_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+                if APP_CODE:
+                    news_headers["APP-Code"] = APP_CODE
+                news_resp = _req.post(
+                    "https://api.aihubmix.com/v1/chat/completions",
+                    headers=news_headers,
+                    json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": f"请搜索{coin_name}今天的最新新闻，列出2-3条最重要的具体事件（含来源）。"}]},
+                    timeout=25
+                )
+                if news_resp.status_code == 200:
+                    news_text = news_resp.json()["choices"][0]["message"]["content"].replace("**", "")
+                    _news_cache[cache_key] = {"text": news_text, "time": time.time()}
+                    with open(_news_cache_file, "w") as _f:
+                        json.dump(_news_cache, _f)
+                    log(f"已搜索并缓存{coin_name}的新闻")
+                else:
+                    log(f"{coin_name}新闻搜索失败: {news_resp.status_code}")
+            except Exception as e:
+                log(f"{coin_name}新闻搜索异常: {e}")
 
-    # 推送: 预警 + AI简析 + 消息面 + 固定话术
-    DISCLAIMER = "\n\n⚠️ 风险提示\n以上分析不构成投资建议，请自行判断风险。"
-    for i in range(0, len(alerts), 5):
-        msg = "🔔 实时监控\n" + "\n\n".join(alerts[i:i+5])
-        if extra_text:
-            msg += "\n" + "-" * 20 + extra_text
+        # 组装消息
+        msg = f"🔔 {coin_name}\n"
+        msg += f"⏰ {_today[:4]}/{_today[4:6]}/{_today[6:8]} {datetime.now().strftime('%H:%M')}\n\n"
+        # 预警
+        for al in coin_alert_list:
+            msg += al + "\n"
+        # 分析
+        if analysis_text:
+            msg += f"\n📊 {analysis_text}\n"
+        # 新闻
+        if news_text:
+            msg += f"\n📰 {news_text}\n"
+        # 固定风控
         msg += DISCLAIMER
+
         try:
             send_simple_message(msg)
-            log(f"已推送 {len(alerts[i:i+5])} 条预警 (含AI分析+消息面)")
+            log(f"已推送 {coin_name} 预警 (含AI分析+消息面)")
             time.sleep(1)
         except Exception as e:
-            log(f"推送失败: {e}")
+            log(f"推送 {coin_name} 失败: {e}")
 
 def monitor_loop():
     log("实时异动监控已启动")
