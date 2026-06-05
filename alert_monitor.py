@@ -239,7 +239,6 @@ def push_alerts(alerts):
             f"⏰ {now_ts}\n"
             f"🔔 实时监控\n"
             f"{coin_alert_list[0]}\n"
-            f"⏰ {alert_ts}\n"
         )
         msg += "--------------------\n"
         if analysis_block:
