@@ -195,17 +195,10 @@ def push_alerts(alerts):
         except Exception as e:
             log(f"分析 {coin_name} 失败: {e}")
 
-        # 新闻（按币种缓存，一天一次）
+        # 新闻：只有今天第一次搜索才带上news_text，后续预警不再输出
         news_text = ""
         cache_key = f"news_{coin_name}_{_today}"
-        if cache_key in _news_cache:
-            cached = _news_cache[cache_key].get("text", "")
-            if cached:
-                news_text = cached.replace("**", "")
-                log(f"{coin_name}使用缓存新闻")
-            else:
-                log(f"{coin_name}缓存存在但内容为空，不搜索")
-        else:
+        if cache_key not in _news_cache:
             try:
                 from wechat_config import AI_API_KEY
                 APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
