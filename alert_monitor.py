@@ -137,7 +137,7 @@ def check_alerts():
 def push_alerts(alerts):
     if not alerts:
         return
-    from crypto_monitor import analyze_symbol, ask_ai
+    from crypto_monitor import analyze_symbol, ask_ai, build_prompt
     from wechat_push import send_simple_message
     import requests as _req, json as _json
 
@@ -182,21 +182,16 @@ def push_alerts(alerts):
                 log(f"推送失败: {e}")
             continue
 
-        # 精简短分析：调用一次 AI 分析该币种
-        analysis_text = ""
+        # 完整分析（调用build_prompt，保留📊+🎯格式）
+        analysis_block = ""
         try:
             coin_symbol = next(s for c, s in WATCHLIST if c == coin_name)
             data, _ = analyze_symbol(coin_name, coin_symbol)
             if "error" not in data:
-                short_prompt = (
-                    f"现在{coin_name}价格${data['price']:.2f}，RSI {data['rsi']}。"
-                    f"请用1-2句话简要分析行情并给出操作建议，控制在80字内。"
-                )
-                reply = ask_ai(short_prompt, model="deepseek-chat")
-                # 去掉可能的标题前缀，只取纯文本
-                lines = reply.strip().split("\n")
-                clean_lines = [l for l in lines if l.strip() and not l.strip().startswith("📊") and not l.strip().startswith("🎯") and not l.strip().startswith("⚠️")]
-                analysis_text = " ".join(clean_lines) if clean_lines else reply.strip()
+                prompt = build_prompt(data)
+                reply = ask_ai(prompt, model="deepseek-chat")
+                # AI回复已自带📊+🎯格式，直接使用
+                analysis_block = reply.strip()
         except Exception as e:
             log(f"分析 {coin_name} 失败: {e}")
 
@@ -234,19 +229,21 @@ def push_alerts(alerts):
             except Exception as e:
                 log(f"{coin_name}新闻搜索异常: {e}")
 
-        # 组装消息
-        msg = f"🔔 {coin_name}\n"
-        msg += f"⏰ {_today[:4]}/{_today[4:6]}/{_today[6:8]} {datetime.now().strftime('%H:%M')}\n\n"
-        # 预警
-        for al in coin_alert_list:
-            msg += al + "\n"
-        # 分析
-        if analysis_text:
-            msg += f"\n📊 {analysis_text}\n"
-        # 新闻
+        # 组装消息（按模板：预警 → 分隔线 → 完整分析 → 分隔线 → 新闻 → 风控）
+        now_ts = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
+        alert_ts = coin_alert_list[0].split("⏰")[-1].strip() if "⏰" in coin_alert_list[0] else now_ts
+        msg = (
+            f"⏰ {now_ts}\n"
+            f"🔔 实时监控\n"
+            f"{coin_alert_list[0]}\n"
+            f"⏰ {alert_ts}\n"
+        )
+        msg += "--------------------\n"
+        if analysis_block:
+            msg += analysis_block + "\n"
+        msg += "--------------------\n"
         if news_text:
-            msg += f"\n📰 {news_text}\n"
-        # 固定风控
+            msg += f"📰 {coin_name} 消息面:\n{news_text}\n"
         msg += DISCLAIMER
 
         try:
