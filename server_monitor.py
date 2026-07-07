@@ -7,11 +7,7 @@ import os
 import sys
 import threading
 
-# 设置 DeepSeek API Key
-import wechat_config
-os.environ["DEEPSEEK_API_KEY"] = wechat_config.DEEPSEEK_API_KEY
-
-sys.path.insert(0, "/root/crypto_agent")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 启动预警检查线程
 print("启动预警检查...")

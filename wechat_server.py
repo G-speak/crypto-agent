@@ -20,7 +20,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 app = Flask(__name__)
 
 # ==================== 配置 ====================
-from wechat_config import TOKEN, ENCODING_AES_KEY, CORPID, AGENTID, SECRET as CORPSECRET
+from wechat_config import TOKEN, ENCODING_AES_KEY, CORPID, AGENTID, SECRET, PORT
+CORPSECRET = SECRET
 
 LOG_FILE = os.path.expanduser("~/.hermes/logs/wechat_callback.log")
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -152,6 +153,12 @@ def handle_message(content, from_user):
 
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
 
+    # ── 精确拦截账本/账单/收益/战报命令（不经过 AI）──
+    if content.strip() in ("账本", "账单", "收益", "战报"):
+        log(f"触发账本查询: {content}")
+        from clients.gateio_trade import generate_ledger_summary
+        return generate_ledger_summary()
+
     # 先尝试解析价格预警
     from price_alerts import parse_alert_from_message
     alert, alert_reply = parse_alert_from_message(content, from_user)
@@ -265,7 +272,7 @@ def handle_coin_query(coin, user_id=None):
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
 
     try:
-        data, chart_path = analyze_symbol(name, symbol)
+        data, _ = analyze_symbol(name, symbol)
         if "error" in data:
             return f"⚠️ {name} 暂时获取不到数据"
 
@@ -277,33 +284,6 @@ def handle_coin_query(coin, user_id=None):
         reply += analysis
 
         # 如果有走势图，后台推送图 + 文字
-        if chart_path and user_id:
-            import threading
-            def push_with_chart():
-                try:
-                    from wechat_push import get_token, send_image, send_text
-                    token = get_token()
-                    time.sleep(0.5)
-                    # 上传图片
-                    import os
-                    with open(chart_path, 'rb') as f:
-                        import requests as rq
-                        url = "https://qyapi.weixin.qq.com/cgi-bin/media/upload"
-                        resp = rq.post(url, params={"access_token": token, "type": "image"},
-                                       files={"media": ("chart.png", f, "image/png")}, timeout=30)
-                        mid = resp.json().get("media_id")
-                    if mid:
-                        # 发图
-                        payload_img = {
-                            "touser": user_id, "msgtype": "image", "agentid": AGENTID,
-                            "image": {"media_id": mid}, "safe": 0
-                        }
-                        rq.post("https://qyapi.weixin.qq.com/cgi-bin/message/send",
-                                params={"access_token": token}, json=payload_img, timeout=10)
-                except Exception as e:
-                    log(f"推送走势图异常: {e}")
-
-            threading.Thread(target=push_with_chart, daemon=True).start()
 
         return reply
 
@@ -503,4 +483,4 @@ if __name__ == "__main__":
     log("企业微信回调服务 (带对话功能)")
     log("=" * 50)
 
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False)

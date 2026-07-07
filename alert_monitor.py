@@ -9,18 +9,12 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ====== 配置 ======
-# 主流币种 (波动阈值3%)
-MAJOR_COINS = ["BTC", "ETH"]
-# 小币种 (波动阈值7%)
-# 其余币种都算小币种
+from wechat_config import MAJOR_COINS, ALERT_COOLDOWN, MONITOR_INTERVAL, CLIENT_NAME
 
-ALERT_COOLDOWN = 1800  # 同一币种同一类型预警最少间隔30分钟
-MONITOR_INTERVAL = 300  # 检查间隔 (5分钟)
-
-LOG_FILE = os.path.expanduser("~/.hermes/logs/alert_monitor.log")
+LOG_FILE = os.path.expanduser(f"~/.hermes/logs/alert_monitor_{CLIENT_NAME}.log")
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-STATE_FILE = os.path.expanduser("~/.hermes/alert_state.json")
-COOLDOWN_FILE = os.path.expanduser("~/.hermes/alert_cooldown.json")
+STATE_FILE = os.path.expanduser(f"~/.hermes/alert_state_{CLIENT_NAME}.json")
+COOLDOWN_FILE = os.path.expanduser(f"~/.hermes/alert_cooldown_{CLIENT_NAME}.json")
 
 def log(msg):
     t = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
@@ -137,28 +131,27 @@ def check_alerts():
 def push_alerts(alerts):
     if not alerts:
         return
-    from crypto_monitor import analyze_symbol, ask_ai, build_prompt
+    from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     from wechat_push import send_simple_message
     import requests as _req, json as _json
+    import hashlib
+    from collections import defaultdict
 
-    from crypto_monitor import WATCHLIST
-    
     # 按币种分组预警
-    coin_alerts = {}  # coin_name -> [alert_lines]
+    coin_alerts = defaultdict(list)
     for a in alerts:
-        matched = None
-        for c_name, _ in WATCHLIST:
-            if c_name in a:
-                matched = c_name
+        found = False
+        for coin_name in MAJOR_COINS:
+            if coin_name in a:
+                coin_alerts[coin_name].append(a)
+                found = True
                 break
-        if matched:
-            coin_alerts.setdefault(matched, []).append(a)
-        else:
-            # 找不到币种的预警单独发
-            coin_alerts.setdefault("__other__", []).append(a)
+        if not found:
+            for c_name, _ in WATCHLIST:
+                if c_name in a:
+                    coin_alerts[c_name].append(a)
+                    break
 
-    # 今天日期缓存
-    _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
     _news_cache_file = os.path.expanduser("~/.hermes/news_cache.json")
     _news_cache = {}
     if os.path.exists(_news_cache_file):
@@ -167,97 +160,214 @@ def push_alerts(alerts):
                 _news_cache = json.load(_f)
         except:
             pass
+    _today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
 
-    DISCLAIMER = "\n\n⚠️ 风险提示\n以上分析不构成投资建议，请自行判断风险。"
+    # 今天已推送过的新闻内容指纹
+    _seen_news = set()
+    _seen_cache_key = f"seen_news_{_today}"
+    if _seen_cache_key in _news_cache:
+        _seen_news = set(_news_cache[_seen_cache_key].get("fingerprints", []))
 
-    for coin_name, coin_alert_list in coin_alerts.items():
-        if coin_name == "__other__":
-            msg = "🔔 实时监控\n\n" + "\n\n".join(coin_alert_list)
-            msg += DISCLAIMER
-            try:
-                send_simple_message(msg)
-                log(f"已推送 {len(coin_alert_list)} 条其他预警")
-                time.sleep(1)
-            except Exception as e:
-                log(f"推送失败: {e}")
-            continue
-
-        # 完整分析（调用build_prompt，保留📊+🎯格式）
-        analysis_block = ""
+    for coin_name in coin_alerts:
         try:
-            coin_symbol = next(s for c, s in WATCHLIST if c == coin_name)
-            data, _ = analyze_symbol(coin_name, coin_symbol)
+            # AI简析 + JSON决策
+            from crypto_monitor import analyze_symbol
+            symbol = next(s for c,s in WATCHLIST if c == coin_name)
+            data, _ = analyze_symbol(coin_name, symbol)
+            ai_text = ""
+            news_text = ""
+            decision_text = ""
             if "error" not in data:
-                prompt = build_prompt(data)
-                reply = ask_ai(prompt, model="deepseek-chat")
-                # AI回复已自带📊+🎯格式，直接使用
-                analysis_block = reply.strip()
-        except Exception as e:
-            log(f"分析 {coin_name} 失败: {e}")
+                # ── 获取新闻（先搜，让决策能看到消息面）──
+                news_text = _fetch_coin_news(coin_name, _news_cache, _news_cache_file, _today)
 
-        # 新闻：只有今天第一次搜索才带上news_text，后续预警不再输出
-        news_text = ""
-        cache_key = f"news_{coin_name}_{_today}"
-        if cache_key not in _news_cache:
-            try:
-                from wechat_config import AI_API_KEY
-                APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
-                news_headers = {
-                    "Authorization": f"Bearer {AI_API_KEY}",
-                    "Content-Type": "application/json"
-                }
-                if APP_CODE:
-                    news_headers["APP-Code"] = APP_CODE
-                news_resp = _req.post(
-                    "https://api.aihubmix.com/v1/chat/completions",
-                    headers=news_headers,
-                    json={"model": "gpt-4o-mini-search-preview", "messages": [{"role": "user", "content": f"请搜索{coin_name}今天的最新新闻，列出最重要的2-3条，每条用一句话概括（含来源）。总字数控制在300字以内。注意：如果{coin_name}没有专属新闻，请说没有相关新闻，不要用大盘行情来填充。"}]},
-                    timeout=25
+                # ── 新版：文字状态 + JSON 决策 ──
+                from clients.json_prompt import build_json_prompt, ask_ai_json
+                decision = ask_ai_json(build_json_prompt(data, coin_name, news_text))
+                action = decision.get("action", "HOLD")
+                reason = decision.get("reason", "")
+
+                # ===== 雷达拦截：BUY/SELL 唤醒 7 角色委员会 =====
+                if action in ["BUY", "SELL"]:
+                    action_cn = "买入" if action == "BUY" else "卖出"
+                    action_emoji_signal = chr(0x1f7e2) if action == "BUY" else chr(0x1f534)
+                    alert_msg = (
+                        f"{chr(0x1f6a8)} 【雷达触发】发现 {coin_name} 潜在 {action_cn} 机会 {action_emoji_signal}\n"
+                        f"浅层初筛理由: {reason}\n"
+                        f"----------------------\n"
+                        f"{chr(0x1f575)}{chr(0x200d)}{chr(0x2642)}{chr(0xfe0f)} 信号已捕获！正在强制唤醒 7 角色投研委员会进行深度评估..."
+                    )
+                    send_simple_message(alert_msg)
+                    log(f"触发浅层 {action} 信号，正在唤醒 7 角色")
+
+                    try:
+                        import seven_roles_committee
+                        seven_roles_committee.run_committee(coin_name, symbol, reason)
+                    except Exception as e:
+                        err_msg = f"{chr(0x26a0)}{chr(0xfe0f)} 7角色深度投研唤醒失败: {e}"
+                        log(err_msg)
+                        send_simple_message(err_msg)
+
+                    # 7角色接管，跳过下方原有的下单和推送逻辑
+                    continue
+                # =======================================================
+
+                # 交易信号推送给用户
+                action_emoji = {"BUY": chr(0x1f7e2) + " 买入信号", "SELL": chr(0x1f534) + " 卖出信号", "HOLD": chr(0x26aa) + " 持有观望"}
+                dr = get_dry_run_status()
+                dry_note = f"\n{chr(0x26a0)}{chr(0xfe0f)} DRY RUN 模式，不会真实下单" if dr else ""
+
+                # ── 执行下单（DRY_RUN 保护），捕获返回值用于 PnL ──
+                trade_result = _execute_trade(coin_name, symbol, action)
+
+                # 提取 PnL（仅 SELL + 有盈亏时）
+                pnl_str = ""
+                if action == "SELL" and trade_result:
+                    pnl_pct = trade_result.get("pnl_pct", 0)
+                    pnl_usdt = trade_result.get("pnl_usdt", 0)
+                    if pnl_pct != 0:
+                        sign = "+" if pnl_pct >= 0 else ""
+                        direction = "赚" if pnl_pct >= 0 else "亏"
+                        pnl_str = f"\n{chr(0x1f9f8)} 模拟平仓收益: {sign}{pnl_pct}% (大约{direction} {abs(pnl_usdt):.2f} USDT)"
+
+                decision_text = (
+                    f"---\n"
+                    f"{chr(0x1f4a4)} {coin_name} 交易决策\n"
+                    f"{action_emoji.get(action, action)}\n"
+                    f"理由: {reason}{dry_note}{pnl_str}"
                 )
-                if news_resp.status_code == 200:
-                    news_text = news_resp.json()["choices"][0]["message"]["content"].replace("**", "")
-                    # 验证：新闻内容必须包含币种名，否则认为是无效的填充
-                    if coin_name.upper() not in news_text.upper() and coin_name.lower() not in news_text.lower():
-                        log(f"{coin_name}新闻不包含币种名，丢弃")
-                        news_text = ""
-                    if news_text:
-                        _news_cache[cache_key] = {"text": news_text, "time": time.time()}
-                        with open(_news_cache_file, "w") as _f:
-                            json.dump(_news_cache, _f)
-                        log(f"已搜索并缓存{coin_name}的新闻")
-                    else:
-                        # 空内容也缓存，避免重复搜索
-                        _news_cache[cache_key] = {"text": "", "time": time.time()}
-                        with open(_news_cache_file, "w") as _f:
-                            json.dump(_news_cache, _f)
-                        log(f"{coin_name}无有效新闻，已记录缓存")
+
+                # ── 旧版简析保留（显示技术摘要给妈妈看）──
+                prompt = build_prompt(data)
+                short_prompt = "请用1-2句话简要分析这个币种的行情，包括价格、RSI和操作建议。控制在80字内。\n\n" + prompt
+                reply = ask_ai(short_prompt, model="auto")
+                text = reply.strip()
+                lines = text.split("\n")
+                start = 0
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("\xf0") and not stripped.startswith("\u26a0"):
+                        start = i
+                        break
+                short_text = "\n".join(lines[start:]).strip()
+                short_reply = short_text if short_text else text
+                ai_text = short_reply
+
+            # 新闻内容去重（_fetch_coin_news 已在决策前完成搜索和缓存）
+            if news_text:
+                fp = hashlib.md5(news_text.encode()).hexdigest()
+                if fp in _seen_news:
+                    news_text = ""  # 今天已经在其他币种消息中出现过，跳过
                 else:
-                    log(f"{coin_name}新闻搜索失败: {news_resp.status_code}")
-            except Exception as e:
-                log(f"{coin_name}新闻搜索异常: {e}")
+                    _seen_news.add(fp)
+                    _news_cache[_seen_cache_key] = {"fingerprints": list(_seen_news), "time": time.time()}
+                    with open(_news_cache_file, "w") as _f:
+                        json.dump(_news_cache, _f)
 
-        # 组装消息（按模板：预警 → 分隔线 → 完整分析 → 分隔线 → 新闻 → 风控）
-        now_ts = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M:%S")
-        alert_ts = coin_alert_list[0].split("⏰")[-1].strip() if "⏰" in coin_alert_list[0] else now_ts
-        msg = (
-            f"⏰ {now_ts}\n"
-            f"🔔 实时监控\n"
-            f"{coin_alert_list[0]}\n"
-        )
-        msg += "--------------------\n"
-        if analysis_block:
-            msg += analysis_block + "\n"
-        msg += "--------------------\n"
-        if news_text:
-            msg += f"📰 {coin_name} 消息面:\n{news_text}\n"
-        msg += DISCLAIMER
+            # 组装消息
+            msg_parts = []
+            # 预警内容
+            coin_alert_text = "\n\n".join(coin_alerts[coin_name])
+            msg_parts.append(coin_alert_text)
 
-        try:
+            # 分隔线 + AI简析
+            if ai_text:
+                msg_parts.append("---")
+                msg_parts.append(f"\U0001f4ca {coin_name} 简析\n{ai_text}")
+
+            # 交易决策
+            if decision_text:
+                msg_parts.append(decision_text)
+
+            # 新闻
+            if news_text:
+                msg_parts.append("---")
+                msg_parts.append(f"\U0001f4b0 消息面\n{news_text}")
+
+            # 风控
+            msg_parts.append("---")
+            msg_parts.append("\u26a0\ufe0f 风控提示\n以上分析仅供参考，不构成投资建议。请自行判断风险。")
+
+            msg = "\n".join(msg_parts)
             send_simple_message(msg)
             log(f"已推送 {coin_name} 预警 (含AI分析+消息面)")
-            time.sleep(1)
+            time.sleep(3)  # 排队削峰：每币种间间隔3秒（付费通道不限流，短间隔即可）
+
         except Exception as e:
-            log(f"推送 {coin_name} 失败: {e}")
+            log(f"推送 {coin_name} 预警失败: {e}")
+
+
+# ====== 辅助函数（量化决策 + 交易执行）======
+
+def get_dry_run_status() -> bool:
+    """返回 gateio_trade 的 DRY_RUN 状态"""
+    try:
+        from clients.gateio_trade import DRY_RUN
+        return DRY_RUN
+    except ImportError:
+        return True  # 模块不存在时保守为 True
+
+
+def _fetch_coin_news(coin_name, news_cache, cache_file, today):
+    """按币种+按天搜索新闻（与原来逻辑一致）"""
+    import requests as _req
+    import json
+    cache_key = f"news_{coin_name}_{today}"
+    now = time.time()
+
+    # 缓存命中直接返回
+    cached = news_cache.get(cache_key, {}).get("text", "")
+    if cached:
+        return cached.replace("**", "")
+
+    # 未命中则搜索
+    try:
+        from wechat_config import AI_API_KEY
+        APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
+        news_prompt = (
+            f"现在是2026年6月。请搜索{coin_name}今天的最新新闻，"
+            f"只列出该币种自身相关的具体事件（含来源），不要混入其他币种或大盘行情。"
+            f"控制在400字以内，必须搜索实时新闻。"
+        )
+        headers = {
+            "Authorization": f"Bearer {AI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        if APP_CODE:
+            headers["APP-Code"] = APP_CODE
+        resp = _req.post(
+            "https://api.aihubmix.com/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "gpt-4o-mini-search-preview",
+                "messages": [{"role": "user", "content": news_prompt}],
+            },
+            timeout=25,
+        )
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"].replace("**", "")
+            news_cache[cache_key] = {"text": text, "time": now}
+            with open(cache_file, "w") as f:
+                json.dump(news_cache, f)
+            log(f"已搜索并缓存{coin_name}的新闻")
+            return text
+        else:
+            log(f"新闻搜索失败({coin_name}): {resp.status_code}")
+    except Exception as e:
+        log(f"新闻搜索异常({coin_name}): {e}")
+    return ""
+
+
+def _execute_trade(coin_name, symbol, action):
+    """根据 AI 决策执行下单（受 DRY_RUN 保护），返回 execute_order 的结果字典"""
+    if action == "HOLD":
+        log(f"[交易] {coin_name} 决策为 HOLD，跳过下单")
+        return {"action": "HOLD", "pnl_pct": 0.0, "pnl_usdt": 0.0}
+    from clients.gateio_trade import execute_order
+    result = execute_order(symbol, action, amount_usdt=10, coin_name=coin_name)
+    log(f"[交易] {coin_name} -> {action}: {result['detail'][:80]}")
+    return result
+
 
 def monitor_loop():
     log("实时异动监控已启动")
@@ -274,7 +384,7 @@ def monitor_loop():
             break
         except Exception as e:
             log(f"异常: {e}\n{traceback.format_exc()}")
-            time.sleep(60)
+            time.sleep(1)
 
 if __name__ == "__main__":
     import sys

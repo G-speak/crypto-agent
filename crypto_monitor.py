@@ -13,44 +13,11 @@ import requests
 import numpy as np
 from datetime import datetime, timezone, timedelta
 
-# ==================== 导入画图库 (容错) ====================
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    from matplotlib.patches import FancyBboxPatch
-    
-    CHART_ENABLED = True
-except ImportError:
-    CHART_ENABLED = False
 
 # ==================== 配置 ====================
-from wechat_config import AI_API_KEY
+from wechat_config import AI_API_KEY, WATCHLIST
 
 HUOBI_BASE = "https://api.huobi.pro"
-
-# (显示名, 火币交易对)
-DEFAULT_WATCHLIST = [
-    ("BTC",  "btcusdt"),
-    ("ETH",  "ethusdt"),
-    ("SOL",  "solusdt"),
-    ("BNB",  "bnbusdt"),
-]
-
-def load_watchlist():
-    """从配置文件加载监控列表，如果没有则用默认值"""
-    cfg_path = os.path.expanduser("~/.hermes/user_watchlist.json")
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path) as f:
-                data = json.load(f)
-            return [(k, v) for k, v in data.items()]
-        except Exception:
-            pass
-    return list(DEFAULT_WATCHLIST)
-
-WATCHLIST = load_watchlist()
 
 CHART_DIR = os.path.expanduser("~/.hermes/crypto_charts")
 os.makedirs(CHART_DIR, exist_ok=True)
@@ -260,126 +227,9 @@ def calc_volume_ratio(volumes, period=20):
     return round(volumes[-1] / avg_vol, 2)
 
 
-# ==================== 画图 ====================
 
-def draw_chart(name, symbol, klines, data):
-    """生成走势图，返回图片路径"""
-    if not CHART_ENABLED:
-        return None
-
-    # 解析K线 (兼容火币和CryptoCompare格式)
-    def k_get(k, field):
-        """兼容获取K线字段"""
-        return k.get(field, k.get({"close":"close","high":"high","low":"low","open":"open","id":"id","amount":"volumefrom"}.get(field, field), 0))
-    
-    times = [datetime.fromtimestamp(k.get("id", k.get("time", 0)), tz=timezone(timedelta(hours=8))) for k in klines]
-    closes = [k.get("close", 0) for k in klines]
-    highs = [k.get("high", 0) for k in klines]
-    lows = [k.get("low", 0) for k in klines]
-    opens = [k.get("open", 0) for k in klines]
-    vols = [k.get("volumefrom", k.get("amount", 0)) for k in klines]
-
-    # 布林带
-    bb_u, bb_m, bb_l = calc_bollinger(np.array(closes))
-    ema20_series = calc_ema_series(np.array(closes), 20)
-    ema50_series = calc_ema_series(np.array(closes), 50)
-
-    # 创建图标 - 深色主题
-    plt.style.use("dark_background")
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),
-                                     gridspec_kw={"height_ratios": [3, 1]},
-                                     sharex=True)
-
-    fig.patch.set_facecolor("#1a1a2e")
-    ax1.set_facecolor("#16213e")
-    ax2.set_facecolor("#16213e")
-
-    # --- 主图: K线 + 均线 + 布林带 ---
-    x = range(len(closes))
-
-    # 布林带填充
-    if bb_u and bb_l:
-        ax1.fill_between(x, [bb_u] * len(x), [bb_l] * len(x),
-                         alpha=0.08, color="#4fc3f7", label="BB")
-
-    # EMA20 / EMA50
-    if len(ema20_series) > 20:
-        ax1.plot(x, ema20_series, color="#fbbf24", linewidth=1.2, alpha=0.8, label="EMA20")
-    if len(ema50_series) > 50:
-        ax1.plot(x, ema50_series, color="#f472b6", linewidth=1.2, alpha=0.8, label="EMA50")
-
-    # 价格线 (用收盘价连成的线，更清晰)
-    ax1.plot(x, closes, color="#60a5fa", linewidth=1.8, alpha=0.9, label=f"{name}")
-
-    # 当前价格标注
-    last_price = closes[-1]
-    ax1.axhline(y=last_price, color="#60a5fa", linewidth=0.8, linestyle="--", alpha=0.4)
-    ax1.annotate(f"${last_price:,.2f}",
-                 xy=(len(closes) - 1, last_price),
-                 xytext=(len(closes) - 1, last_price),
-                 fontsize=11, color="#60a5fa", fontweight="bold",
-                 va="bottom", ha="right")
-
-    # 标题 - 全英文避免中文字体问题
-    change_str = f"{data['change_24h']:+.2f}%"
-    change_color = "#22c55e" if data['change_24h'] >= 0 else "#ef4444"
-    ax1.set_title(f"  {name}/{symbol.upper()}  |  ${last_price:,.2f}  |  24h: ",
-                  color="#e2e8f0", fontsize=13, fontweight="bold", loc="left")
-    ax1.text(0.5, 0.975, change_str, transform=ax1.transAxes,
-             fontsize=13, color=change_color, fontweight="bold",
-             va="top", ha="left")
-
-    # 图例 — 用英文避免乱码
-    ax1.legend(loc="upper left", fontsize=8, facecolor="#1e293b",
-               edgecolor="none", labelcolor="#cbd5e1")
-
-    # Y轴格式
-    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.0f}"))
-    ax1.tick_params(colors="#64748b", labelsize=9)
-    ax1.grid(True, alpha=0.15, color="#475569")
-
-    # --- 副图: RSI ---
-    rsi_values = []
-    for i in range(len(closes)):
-        rsi_values.append(calc_rsi(np.array(closes[:i+1])))
-
-    ax2.plot(x, rsi_values, color="#a78bfa", linewidth=1.5, alpha=0.9, label="RSI(14)")
-    ax2.axhline(y=70, color="#ef4444", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax2.axhline(y=30, color="#22c55e", linewidth=0.8, linestyle="--", alpha=0.5)
-    ax2.fill_between(x, rsi_values, 50, where=np.array(rsi_values) >= 50,
-                     color="#ef4444", alpha=0.06)
-    ax2.fill_between(x, rsi_values, 50, where=np.array(rsi_values) < 50,
-                     color="#22c55e", alpha=0.06)
-
-    ax2.set_ylim(0, 100)
-    ax2.set_ylabel("RSI", color="#64748b", fontsize=9)
-    ax2.tick_params(colors="#64748b", labelsize=9)
-    ax2.grid(True, alpha=0.15, color="#475569")
-    ax2.legend(loc="upper left", fontsize=8, facecolor="#1e293b",
-               edgecolor="none", labelcolor="#cbd5e1")
-
-    # X轴时间标签
-    n = len(x)
-    if n > 20:
-        step = max(1, n // 6)
-        ax2.set_xticks(range(0, n, step))
-        tick_labels = [times[i].strftime("%m/%d\n%H:%M") for i in range(0, n, step)]
-        ax2.set_xticklabels(tick_labels, fontsize=8)
-
-    plt.tight_layout(pad=1.5)
-
-    # 保存
-    filename = f"{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    filepath = os.path.join(CHART_DIR, filename)
-    plt.savefig(filepath, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-
-    return filepath
-
-
-# ==================== 分析 ====================
 def analyze_symbol(name, symbol):
-    """分析一个币种"""
+    """分析一个币种（已移除画图功能）"""
     try:
         cc_ticker, cc_klines, cc_change = gate_get_ticker(symbol)
         ticker = cc_ticker
@@ -391,10 +241,10 @@ def analyze_symbol(name, symbol):
     volumes = np.array([k.get("volumefrom", k.get("amount", 0)) for k in klines])
 
     current_price = ticker["close"]
-    open_price = ticker["open"]
+    open_price = ticker.get("open", 0)
     high_24h = ticker["high"]
     low_24h = ticker["low"]
-    change_pct = round((current_price - open_price) / open_price * 100, 2)
+    change_pct = round(cc_change, 2)
 
     rsi = calc_rsi(closes)
     ema20 = calc_ema(closes, 20)
@@ -430,9 +280,7 @@ def analyze_symbol(name, symbol):
     }
 
     # 画图
-    chart_path = draw_chart(name, symbol, klines, data)
-
-    return data, chart_path
+    return data, None
 
 
 # ==================== AI 分析 ====================
@@ -474,64 +322,87 @@ MACD: {fmt(s['macd'], suffix="")}
 建议: [买入/卖出/持有]
 参考价位: [如有]
 止损参考: [如有]
-理由: [一句话]
-
-⚠️ 风险提示
-注意：不需要写风险提示段落，程序会自动追加。"""
+理由: [一句话]"""
 
 
 def ask_ai(prompt, model="auto"):
-    """调用AI分析，支持自动模型路由"""
-    from wechat_config import AI_API_KEY, DEEPSEEK_API_KEY
+    """调用AI分析，支持双平台动态路由 + 多模型轮询池 + 每模型3次重试"""
+
+    # MODEL_POOL：付费模型走 Yunwu（不限流，优先），含 free 的走 AIHubMix（备用）
+    MODEL_POOL = [
+        "deepseek-v4-flash",    # [Yunwu付费] 主力付费，速度最快，不限流
+        "deepseek-v3.2",        # [Yunwu付费] JSON 稳定性最佳
+        "MAI-DS-R1",            # [Yunwu付费] 微软微调推理兜底
+        "gpt-4.1-nano-free",    # [AIHubMix免费] 备用免费模型
+        "gpt-4.1-mini-free",    # [AIHubMix免费] 备用免费模型
+        "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰 Flash
+    ]
+
+    from wechat_config import AI_API_KEY, YUNWU_API_KEY
     APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
 
-    # 智能路由
     if model == "auto":
-        prompt_lower = prompt.lower()
-        # 需要实时信息的场景 -> Grok
-        if any(kw in prompt_lower for kw in ["今日", "今天", "最近", "刚刚", "最新", "动态", "发生了什么", "新闻", "实时", "消息", "事件"]):
-            use_model = "grok-4.3"
-            api_url = "https://api.aihubmix.com/v1/chat/completions"
-            api_key = AI_API_KEY
-        else:
-            use_model = "deepseek-chat"
-            api_url = "https://api.deepseek.com/v1/chat/completions"
-            api_key = DEEPSEEK_API_KEY
+        candidate_models = MODEL_POOL
     else:
-        use_model = model
-        if model == "deepseek-chat":
-            api_url = "https://api.deepseek.com/v1/chat/completions"
-            api_key = DEEPSEEK_API_KEY
-        else:
+        candidate_models = [model]
+
+    last_exception = None
+
+    for use_model in candidate_models:
+        # 双平台路由：含 "free" 用 AIHubMix，否则用 Yunwu
+        if "free" in use_model.lower():
             api_url = "https://api.aihubmix.com/v1/chat/completions"
             api_key = AI_API_KEY
+        else:
+            api_url = "https://yunwu.ai/v1/chat/completions"
+            api_key = YUNWU_API_KEY
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    # 调用 AIHubMix 时加上 APP-Code 头（享受10%优惠）
-    if "aihubmix" in api_url and APP_CODE:
-        headers["APP-Code"] = APP_CODE
-    payload = {
-        "model": use_model,
-        "messages": [
-            {"role": "system", "content": "你是一个专业的加密货币技术分析师。\n\n铁律：\n1. 所有价格、涨跌幅、RSI等数据必须严格使用用户提供的数据，绝对不要自己编造或凭记忆猜测\n2. 如果用户提到一个币种但你没有它的实时数据，就说\"暂无该币种实时数据\"\n3. 回复要简洁有用，控制在150字内\n4. 使用中文回复。注意：不需要写风险提示/免责声明，程序会自动追加。"},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 500
-    }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        if "aihubmix" in api_url and APP_CODE:
+            headers["APP-Code"] = APP_CODE
 
-    try:
-        resp = requests.post(
-            api_url,
-            headers=headers, json=payload, timeout=15
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"⚠️ AI 分析调用失败: {e}"
+        payload = {
+            "model": use_model,
+            "messages": [
+                {"role": "system", "content": "你是一个专业的加密货币技术分析师。\n\n铁律：\n1. 所有价格、涨跌幅、RSI等数据必须严格使用用户提供的数据，绝对不要自己编造或凭记忆猜测\n2. 如果用户提到一个币种但你没有它的实时数据，就说\"暂无该币种实时数据\"\n3. 回复要简洁有用，控制在150字内\n4. 任何分析和建议都不构成投资建议，请提醒用户自行判断风险。使用中文回复。"},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 500
+        }
+
+        # 每模型内部3次重试（应对429限流等瞬时错误）
+        for attempt in range(1, 4):
+            try:
+                resp = requests.post(
+                    api_url,
+                    headers=headers, json=payload, timeout=60
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except requests.exceptions.HTTPError as e:
+                if resp is not None and resp.status_code == 429 and attempt < 3:
+                    log(f"[ask_ai] 模型 {use_model} 429限流，等待3秒后第{attempt+1}次重试...")
+                    time.sleep(3)
+                    continue
+                # 非429或最后一次重试仍失败，记录异常并切模型
+                last_exception = e
+                log(f"[ask_ai] 模型 {use_model} HTTP错误: {e}，切换至下一模型")
+                break
+            except Exception as e:
+                last_exception = e
+                if attempt < 3:
+                    log(f"[ask_ai] 模型 {use_model} 请求异常，等待3秒后第{attempt+1}次重试...")
+                    time.sleep(3)
+                    continue
+                log(f"[ask_ai] 模型 {use_model} 重试3次均失败，切换至下一模型")
+                break
+
+    # 全部模型都失败
+    return f"⚠️ AI 分析调用失败: {last_exception}"
 # ==================== 主程序 ====================
 
 def main():
@@ -542,7 +413,6 @@ def main():
     print(f"  🔮 虚拟币监控 AI 助手")
     print(f"  📅 {now_bj.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
     print(f"  📡 数据源: 火币 (Huobi)")
-    print(f"  🖼️  走势图: {'✅ 已启用' if CHART_ENABLED else '❌ 未安装matplotlib'}")
     print("=" * 60)
     print()
 
@@ -566,8 +436,7 @@ def main():
         # 显示图路径
         if chart_path:
             charts.append(chart_path)
-            print(f"  🖼️  走势图: {chart_path}")
-
+        
         print(f"  📊 RSI: {data['rsi']} ({data['rsi_signal']})  |  成交量比: {data['vol_ratio']}x")
         print()
 
@@ -582,7 +451,6 @@ def main():
 
     print("=" * 60)
     print("  分析完成 ✅")
-    print(f"  共生成 {len(charts)} 张走势图")
     print("=" * 60)
 
 
