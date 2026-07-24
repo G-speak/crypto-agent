@@ -12,6 +12,12 @@ Gate.io 交易执行模块
   - 自动记录每笔模拟交易到 ~/.hermes/paper_trading_log.json
   - SELL 时自动回溯最近一次同币种 BUY，计算盈亏比例和绝对值
   - 盈亏数据通过 execute_order 返回值透出，供 alert_monitor 拼入推送
+  - 支持按百分比仓位下单（percentage 参数），由 7 角色委员会的风控经理决定
+
+多仓模式（v2 新增）：
+  - 同一币种允许分批多次买入（取消单仓位 BUY 拦截）
+  - 空仓时 SELL 直接快速拦截，不触发委员会讨论
+  - 每次交易金额由 percentage 参数动态计算
 """
 
 import os
@@ -19,7 +25,7 @@ import sys
 import json
 import time
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from collections import OrderedDict
 
 # ── 全局安全开关 ──
@@ -37,6 +43,12 @@ _ENV_PATH = os.path.expanduser("~/.hermes/gateio.env")
 
 # 虚拟账本路径
 _PAPER_LOG = os.path.expanduser("~/.hermes/paper_trading_log.json")
+
+# ── 初始资金配置 ──
+# 人民币计价，便于用户理解
+INITIAL_CAPITAL_CNY = 500.0       # 初始资金 500 元人民币
+USDT_CNY_RATE = 7.25              # 当前 USDT/CNY 汇率（约）
+INITIAL_CAPITAL = round(INITIAL_CAPITAL_CNY / USDT_CNY_RATE, 2)  # ≈ 69 USDT
 
 
 # ==================== 虚拟账本（DRY_RUN 用）====================
@@ -84,6 +96,11 @@ def _bjt_now_str() -> str:
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _today_str() -> str:
+    """当天日期字符串 (YYYY-MM-DD)"""
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
 def _calc_pnl(coin_base: str, action: str, fill_price: float, quantity: float,
               ledger: list) -> dict:
     """
@@ -115,41 +132,95 @@ def _calc_pnl(coin_base: str, action: str, fill_price: float, quantity: float,
     return {"pnl_pct": 0.0, "pnl_usdt": 0.0, "cost_basis": 0.0}
 
 
-def _get_holdings(ledger: list = None) -> dict:
+def _get_open_positions(ledger: list = None) -> dict:
     """
-    从虚拟账本计算当前持仓。
-    返回: {"BTC": {"quantity": 0.1, "cost": 65000}, "ETH": {...}}
+    从虚拟账本计算当前持仓（含每笔未平仓的买入记录）。
+
+    返回: {
+      "BTC": {
+        "entries": [
+          {"qty": 0.1, "price": 65000, "time": "..."},
+          {"qty": 0.05, "price": 62000, "time": "..."}
+        ],
+        "total_qty": 0.15,
+        "avg_cost": 64000,
+        "total_cost": 9600
+      },
+      ...
+    }
     空仓返回空字典。
     """
     if ledger is None:
         ledger = _load_ledger()
 
-    holdings = {}
+    # 先用 FIFO 方式跟踪哪些 BUY 已被 SELL 抵消
+    buy_queue = {}  # coin -> [{"qty": x, "price": y, "time": z}, ...]
+
     for entry in ledger:
         coin = entry.get("coin", entry.get("base", ""))
         action = entry.get("action", "")
         qty = entry.get("quantity", 0)
         price = entry.get("fill_price", 0)
+        t = entry.get("time", "")
+
         if action == "BUY":
-            if coin not in holdings:
-                holdings[coin] = {"quantity": 0.0, "total_cost": 0.0}
-            holdings[coin]["quantity"] += qty
-            holdings[coin]["total_cost"] += qty * price
+            if coin not in buy_queue:
+                buy_queue[coin] = []
+            buy_queue[coin].append({"qty": qty, "price": price, "time": t})
+
         elif action == "SELL":
-            if coin in holdings:
-                held_qty = holdings[coin]["quantity"]
-                if qty >= held_qty:
-                    del holdings[coin]
+            if coin not in buy_queue:
+                continue
+            remaining = qty
+            while remaining > 0 and buy_queue[coin]:
+                first = buy_queue[coin][0]
+                if first["qty"] <= remaining:
+                    remaining -= first["qty"]
+                    buy_queue[coin].pop(0)
                 else:
-                    holdings[coin]["quantity"] -= qty
-                    # 按比例扣减成本
-                    ratio = qty / held_qty
-                    holdings[coin]["total_cost"] *= (1 - ratio)
+                    first["qty"] -= remaining
+                    remaining = 0
+            # 如果队列空了，删除键
+            if not buy_queue[coin]:
+                del buy_queue[coin]
+
+    # 整理成返回格式
+    result = {}
+    for coin, queue in buy_queue.items():
+        if not queue:
+            continue
+        total_qty = sum(e["qty"] for e in queue)
+        total_cost = sum(e["qty"] * e["price"] for e in queue)
+        avg_cost = round(total_cost / total_qty, 2) if total_qty > 0 else 0
+        result[coin] = {
+            "entries": queue,
+            "total_qty": total_qty,
+            "avg_cost": avg_cost,
+            "total_cost": total_cost,
+        }
+    return result
+
+
+def _get_holdings(ledger: list = None) -> dict:
+    """
+    从虚拟账本计算当前持仓（简化版，兼容旧调用方）。
+    返回: {"BTC": {"quantity": 0.1, "cost": 65000}, "ETH": {...}}
+    空仓返回空字典。
+    """
+    positions = _get_open_positions(ledger)
+    holdings = {}
+    for coin, info in positions.items():
+        holdings[coin] = {
+            "quantity": info["total_qty"],
+            "avg_cost": info["avg_cost"],
+            "total_cost": info["total_cost"],
+        }
     return holdings
 
 
 def _paper_trade(ccxt_symbol: str, coin_name: str, action: str,
-                 amount_usdt: float) -> dict:
+                 amount_usdt: float, percentage: int = 0,
+                 current_qty: float = 0.0) -> dict:
     """
     虚拟账本交易：获取市价、记录、计算 PnL。
 
@@ -167,7 +238,16 @@ def _paper_trade(ccxt_symbol: str, coin_name: str, action: str,
     # 提取基础币种（如 BTC/USDT → BTC）
     coin_base = ccxt_symbol.split("/")[0]
     fill_price = _fetch_current_price(ccxt_symbol)
-    quantity = round(amount_usdt / fill_price, 8) if fill_price > 0 else 0
+
+    # 根据 percentage 计算实际数量
+    if percentage > 0 and action.upper() == "SELL" and current_qty > 0:
+        # SELL: 按持仓比例
+        quantity = round(current_qty * percentage / 100, 8)
+    elif percentage > 0 and action.upper() == "BUY":
+        # BUY: amount_usdt 已在 execute_order 中按比例计算好
+        quantity = round(amount_usdt / fill_price, 8) if fill_price > 0 else 0
+    else:
+        quantity = round(amount_usdt / fill_price, 8) if fill_price > 0 else 0
 
     side_cn = "买入" if action.upper() == "BUY" else "卖出"
 
@@ -203,9 +283,10 @@ def _paper_trade(ccxt_symbol: str, coin_name: str, action: str,
         direction = "赚" if pnl_pct >= 0 else "亏"
         pnl_str = f"\n  💸 模拟平仓: {sign}{pnl_pct}% ({direction} ~{abs(pnl_usdt)} USDT, 买入价 ${pnl['cost_basis']:.2f})"
 
+    pct_info = f" (仓位 {percentage}%)" if percentage > 0 else ""
     msg = (
         f"[DRY RUN] 模拟下单 (已记入虚拟账本)：\n"
-        f"  交易对: {ccxt_symbol}\n"
+        f"  交易对: {ccxt_symbol}{pct_info}\n"
         f"  方向: {side_cn}\n"
         f"  成交价: ${fill_price:,.2f}\n"
         f"  数量: {quantity}\n"
@@ -265,15 +346,18 @@ def _check_symbol(symbol: str) -> str:
 # ==================== 主入口 ====================
 
 def execute_order(symbol: str, action: str, amount_usdt: float = 10,
-                  coin_name: str = "") -> dict:
+                  coin_name: str = "", percentage: int = 0) -> dict:
     """
     执行 Gate.io 市价单（受 DRY_RUN 保护）。
 
     参数:
         symbol: "btcusdt" / "BTC_USDT" / "BTC/USDT"
         action: "BUY" / "SELL" / "HOLD"
-        amount_usdt: 下单金额（USDT 计价），默认 10 USDT
+        amount_usdt: 基础下单金额（USDT 计价），默认 10 USDT
+                     当 percentage > 0 时，此参数作为兜底值
         coin_name: 币种可读名称（如 "BTC"），用于账本记录；为空时从 symbol 推断
+        percentage: 仓位百分比（0-100），BUY时占可用余额，SELL时占持仓量
+                    由 alert_monitor / 7角色委员会传入
 
     返回:
         {
@@ -310,11 +394,12 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
     if not coin_name:
         coin_name = ccxt_symbol.split("/")[0]
 
-    # ── 仓位感知拦截（防止空仓SELL / 满仓BUY）──
+    # ── 仓位检查 ──
     coin_base = ccxt_symbol.split("/")[0]
     holdings = _get_holdings()
     current_qty = holdings.get(coin_base, {}).get("quantity", 0.0)
 
+    # 空仓 SELL → 快速拦截（不触发委员会，直接返回）
     if action.upper() == "SELL" and current_qty <= 0:
         msg = f"⛔ 空仓拦截: {coin_name} 当前持仓为0，拒绝执行 SELL（已记录日志）"
         _logger.warning(msg)
@@ -322,16 +407,59 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
         result["success"] = True  # 不报错，静默拦截
         return result
 
-    if action.upper() == "BUY" and current_qty > 0:
-        msg = f"⛔ 仓位拦截: {coin_name} 当前已有持仓 (数量 {current_qty:.8f})，拒绝重复 BUY（已记录日志）"
-        _logger.warning(msg)
-        result["detail"] = msg
-        result["success"] = True
-        return result
+    # 【多仓模式】取消单仓位 BUY 拦截：
+    # 同一币种允许分批多次买入，由 7 角色委员会的风控经理决定每次的仓位比例
+    # 下⾯不再检查 BUY 时是否已有持仓
+
+    # ── 根据 percentage 计算实际下单金额/数量 ──
+    if percentage > 0:
+        if action.upper() == "BUY":
+            # 计算可用余额
+            ledger = _load_ledger()
+            # 计算已卖出回笼的资金
+            sell_proceeds = 0.0
+            for e in ledger:
+                if e.get("action") == "SELL":
+                    sell_qty = e.get("quantity", 0)
+                    sell_price = e.get("fill_price", 0)
+                    sell_proceeds += sell_qty * sell_price
+            # 计算所有 BUY 耗用的总资金
+            buy_spent = 0.0
+            for e in ledger:
+                if e.get("action") == "BUY":
+                    buy_qty = e.get("quantity", 0)
+                    buy_price = e.get("fill_price", 0)
+                    buy_spent += buy_qty * buy_price
+
+            # 当前持仓市值
+            holdings_value = 0.0
+            for coin, info in holdings.items():
+                hold_qty = info.get("quantity", 0)
+                if hold_qty > 0:
+                    try:
+                        import requests as _req
+                        price_url = f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={coin}_USDT"
+                        price_resp = _req.get(price_url, timeout=5)
+                        if price_resp.status_code == 200:
+                            cur_price = float(price_resp.json()[0]["last"])
+                            holdings_value += hold_qty * cur_price
+                    except Exception:
+                        holdings_value += info.get("total_cost", 0)
+
+            # 可用余额 = 初始总资产 - 持仓市值 + 已卖出回笼
+            available = INITIAL_CAPITAL - holdings_value + sell_proceeds
+            if available < 1:
+                available = 1
+            amount_usdt = round(available * percentage / 100, 2)
+
+        elif action.upper() == "SELL" and current_qty > 0:
+            # SELL 时 amount_usdt 无意义，传 0 标记为"按比例"
+            amount_usdt = 0
 
     # ── DRY_RUN 模式：虚拟账本 ──
     if DRY_RUN:
-        trade_result = _paper_trade(ccxt_symbol, coin_name, action, amount_usdt)
+        trade_result = _paper_trade(ccxt_symbol, coin_name, action, amount_usdt,
+                                     percentage=percentage, current_qty=current_qty)
         result.update(trade_result)
         return result
 
@@ -402,22 +530,27 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
         return result
 
 
-INITIAL_CAPITAL_CNY = 500.0  # 初始资金 500 元人民币
-USDT_CNY_RATE = 7.25  # 当前 USDT/CNY 汇率（约）
+# ==================== 账本报告（增强版）====================
 
 def generate_ledger_summary() -> str:
     """
     读取虚拟账本，生成总资产状态文字报告（人民币计价）。
-    初始资金: 500 元人民币 ≈ 69 USDT
+
+    包含：
+      - 总览：余额、盈亏、胜率、交易次数
+      - 当日交易明细（BUY/SELL 活动）
+      - 当前持仓详情（币种、数量、均价、现价、浮动盈亏）
+      - 已平仓交易汇总
     """
     ledger = _load_ledger()
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M")
+    tday = _today_str()
 
     if not ledger:
         return (
-            f"📊 ⚖️ AI 模拟盘总账本（人民币）  [{now_str}]\n"
+            f"📊 ⚖️ AI 模拟盘总账本  [{now_str}]\n"
             f"----------------------\n"
-            f"💰 初始本金: {INITIAL_CAPITAL_CNY:.0f} 元\n"
+            f"💰 初始本金: {INITIAL_CAPITAL_CNY:.0f} 元  (~${INITIAL_CAPITAL:.0f})\n"
             f"📊 当前余额: {INITIAL_CAPITAL_CNY:.0f} 元\n"
             f"📈 累计盈亏: 0.00 元\n"
             f"🔢 交易次数: 0 次\n"
@@ -426,39 +559,99 @@ def generate_ledger_summary() -> str:
             f"等待 AI 策略触发首次交易信号..."
         )
 
+    # ===== 总览统计 =====
     total_trades = len(ledger)
     sell_records = [e for e in ledger if e.get("action") == "SELL" and e.get("pnl_pct") is not None]
     total_pnl_usdt = round(sum(e.get("pnl_usdt", 0) for e in sell_records), 2)
     total_pnl_cny = round(total_pnl_usdt * USDT_CNY_RATE, 2)
-    current_balance_cny = round(INITIAL_CAPITAL_CNY + total_pnl_cny, 2)
+
+    # 浮动盈亏
+    positions = _get_open_positions(ledger)
+    total_unrealized_usdt = 0.0
+    for coin, info in positions.items():
+        cur_price = _fetch_current_price(f"{coin}/USDT")
+        if cur_price > 0:
+            total_unrealized_usdt += round((cur_price - info["avg_cost"]) * info["total_qty"], 2)
+    total_unrealized_cny = round(total_unrealized_usdt * USDT_CNY_RATE, 2)
+
+    # 总资产 = 本金 + 已实现盈亏 + 浮动盈亏
+    total_assets_usdt = round(INITIAL_CAPITAL + total_pnl_usdt + total_unrealized_usdt, 2)
+    total_assets_cny = round(total_assets_usdt * USDT_CNY_RATE, 2)
 
     win_count = sum(1 for e in sell_records if e.get("pnl_usdt", 0) > 0)
     win_rate = round(win_count / len(sell_records) * 100, 1) if sell_records else 0.0
 
-    # 当前持仓
-    bought = set()
-    for e in ledger:
-        if e.get("action") == "BUY":
-            bought.add(e.get("coin", e.get("base", "")))
-        elif e.get("action") == "SELL":
-            coin = e.get("coin", e.get("base", ""))
-            bought.discard(coin)
-    holdings = ", ".join(sorted(bought)) if bought else "无（空仓）"
+    # ===== 当日交易明细 =====
+    today_trades = [e for e in ledger if e.get("time", "").startswith(tday)]
+    today_buys = [e for e in today_trades if e.get("action") == "BUY"]
+    today_sells = [e for e in today_trades if e.get("action") == "SELL"]
 
-    sign = "+" if total_pnl_cny >= 0 else ""
-    emoji = "📈" if total_pnl_cny >= 0 else "📉"
+    today_section = ""
+    if today_trades:
+        lines = []
+        for e in today_trades:
+            act = e.get("action", "")
+            coin = e.get("coin", e.get("base", ""))
+            p = e.get("fill_price", 0)
+            q = e.get("quantity", 0)
+            t = e.get("time", "").split(" ")[-1][:5]  # HH:MM
+            pnl = ""
+            if act == "SELL" and e.get("pnl_usdt"):
+                s = "+" if e["pnl_usdt"] >= 0 else ""
+                pnl = f" 盈亏:{s}{e['pnl_usdt']:.2f}USDT"
+            lines.append(f"  {t} {act} {coin} ${p:.2f} x {q}{pnl}")
+
+        today_section = (
+            f"\n📅 今日交易 ({len(today_buys)}买/{len(today_sells)}卖)\n"
+            + "\n".join(lines)
+        )
+
+    # ===== 持仓详情（实时盈亏）=====
+    positions_section = ""
+    if positions:
+        pos_lines = []
+        for coin, info in sorted(positions.items()):
+            avg_cost = info["avg_cost"]
+            total_qty = info["total_qty"]
+            cur_price = _fetch_current_price(f"{coin}/USDT")
+            if cur_price > 0:
+                unrealized = round((cur_price - avg_cost) * total_qty, 2)
+                pct = round((cur_price - avg_cost) / avg_cost * 100, 2)
+                sign = "+" if unrealized >= 0 else ""
+                emoji = "📈" if unrealized >= 0 else "📉"
+                pos_lines.append(
+                    f"  {emoji} {coin}: {total_qty:.6f} 均价${avg_cost:.2f} "
+                    f"→ 现价${cur_price:.2f} ({sign}{pct}%) "
+                    f"浮动盈亏: {sign}{unrealized:.2f}USDT"
+                )
+            else:
+                pos_lines.append(
+                    f"  🪙 {coin}: {total_qty:.6f} @ ${avg_cost:.2f} (暂无法获取实时价格)"
+                )
+
+        sign = "+" if total_unrealized_usdt >= 0 else ""
+        positions_section = (
+            f"\n🪙 持仓详情 ({len(positions)} 币种)\n" + "\n".join(pos_lines) +
+            f"\n  {'─' * 20}\n  📊 浮动盈亏合计: {sign}{total_unrealized_usdt:.2f}USDT ({sign}{total_unrealized_cny:.2f}元)"
+        )
+    else:
+        positions_section = "\n🪙 当前持仓: 无（空仓）"
+
+    # ===== 拼接 =====
+    sign_pnl = "+" if total_pnl_cny >= 0 else ""
+    pnl_emoji = "📈" if total_pnl_cny >= 0 else "📉"
 
     return (
-        f"📊 ⚖️ AI 模拟盘总账本（人民币）  [{now_str}]\n"
+        f"📊 ⚖️ AI 模拟盘总账本  [{now_str}]\n"
         f"----------------------\n"
-        f"💰 初始本金: {INITIAL_CAPITAL_CNY:.0f} 元\n"
-        f"📊 当前余额: {current_balance_cny:.2f} 元\n"
-        f"{emoji} 累计盈亏: {sign}{total_pnl_cny:.2f} 元\n"
+        f"💰 初始本金: {INITIAL_CAPITAL_CNY:.0f} 元  (~${INITIAL_CAPITAL:.0f})\n"
+        f"🏦 总资产: {total_assets_cny:.2f} 元  (~${total_assets_usdt:.2f})\n"
+        f"{pnl_emoji} 累计已实现盈亏: {sign_pnl}{total_pnl_cny:.2f} 元  ({sign_pnl}{total_pnl_usdt:.2f} USDT)\n"
         f"🎯 胜率: {win_rate}% ({win_count}/{len(sell_records)} 笔盈利)\n"
-        f"🔢 交易次数: {total_trades} 次\n"
-        f"🪙 持仓: {holdings}\n"
+        f"🔢 总交易次数: {total_trades} 次{today_section}"
+        f"{positions_section}\n"
         f"----------------------\n"
-        f"(数据每逢大盘异动自动更新)"
+        f"🤖 由 7 角色 AI 投研委员会自动管理"
     )
 
 
@@ -469,29 +662,45 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"DRY_RUN = {DRY_RUN}")
     print(f"账本: {_PAPER_LOG}")
+    print(f"初始资金: ${INITIAL_CAPITAL} ({INITIAL_CAPITAL_CNY}元)")
     print()
 
-    # 清空测试账本
-    _save_ledger([])
-
-    # 模拟流程：BTC 买入 → BTC 卖出（应有盈亏）→ ETH 买入 → ETH 买入 → ETH 卖出
-    tests = [
-        ("btcusdt", "BUY", 10, "BTC"),
-        ("ethusdt", "BUY", 20, "ETH"),
-        ("btcusdt", "SELL", 10, "BTC"),
-        ("ethusdt", "BUY", 15, "ETH"),
-        ("ethusdt", "SELL", 35, "ETH"),
-    ]
-    for sym, act, amt, name in tests:
-        r = execute_order(sym, act, amt, coin_name=name)
-        pnl = f" | PnL: {r['pnl_pct']:+.2f}%" if r['pnl_pct'] != 0 else ""
-        print(f"  {act} {name}: ${r['fill_price']:.2f} x {r['quantity']}{pnl}")
-
-    print()
-    print("─" * 50)
-    print("虚拟账本内容：")
-    print("─" * 50)
+    # 读现有账本，不覆盖
     ledger = _load_ledger()
-    for entry in ledger:
-        pnl = f" | PnL: {entry.get('pnl_pct', 0):+.2f}% ({entry.get('pnl_usdt', 0):+.2f} USDT)" if entry.get('pnl_pct') else ""
-        print(f"  {entry['time']} | {entry['action']} {entry['coin']} @ ${entry['fill_price']:.2f}{pnl}")
+    if ledger:
+        print(f"现有账本有 {len(ledger)} 条记录")
+        print(f"执行 generate_ledger_summary() 预览：")
+        print()
+        print(generate_ledger_summary())
+        print()
+        print("─" * 50)
+        print("各条记录：")
+        for entry in ledger:
+            pnl = f" | PnL: {entry.get('pnl_pct', 0):+.2f}% ({entry.get('pnl_usdt', 0):+.2f} USDT)" if entry.get('pnl_pct') else ""
+            print(f"  {entry['time']} | {entry['action']} {entry['coin']} @ ${entry['fill_price']:.2f}{pnl}")
+    else:
+        print("账本为空，运行模拟测试...")
+        print()
+
+        # 清空测试账本
+        _save_ledger([])
+
+        # 模拟多仓模式测试（同一币种多次买入）
+        tests = [
+            ("btcusdt", "BUY", 10, "BTC", 0),
+            ("btcusdt", "BUY", 15, "BTC", 0),   # 多仓：第二次买入 BTC
+            ("ethusdt", "BUY", 20, "ETH", 0),
+            ("btcusdt", "SELL", 10, "BTC", 0),
+            ("ethusdt", "BUY", 15, "ETH", 0),
+            ("ethusdt", "SELL", 35, "ETH", 0),
+        ]
+        for sym, act, amt, name, pct in tests:
+            r = execute_order(sym, act, amt, coin_name=name, percentage=pct)
+            pnl = f" | PnL: {r['pnl_pct']:+.2f}%" if r['pnl_pct'] != 0 else ""
+            print(f"  {act} {name}: ${r['fill_price']:.2f} x {r['quantity']}{pnl}")
+
+        print()
+        print("─" * 50)
+        print("增强版账本报告：")
+        print("─" * 50)
+        print(generate_ledger_summary())
