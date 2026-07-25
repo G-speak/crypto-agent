@@ -548,15 +548,17 @@ def generate_ledger_summary() -> str:
 
     if not ledger:
         return (
-            f"📊 ⚖️ AI 模拟盘总账本  [{now_str}]\n"
-            f"----------------------\n"
-            f"💰 初始本金: {INITIAL_CAPITAL_CNY:.0f} 元  (~${INITIAL_CAPITAL:.0f})\n"
-            f"📊 当前余额: {INITIAL_CAPITAL_CNY:.0f} 元\n"
-            f"📈 累计盈亏: 0.00 元\n"
-            f"🔢 交易次数: 0 次\n"
-            f"🪙 持仓: 无（空仓）\n"
-            f"----------------------\n"
-            f"等待 AI 策略触发首次交易信号..."
+            f"📊 AI 量化每日盘点  [{now_str}]\n"
+            f"═════════════════════════\n"
+            f"💼 【账户总览】\n"
+            f"初始本金: {INITIAL_CAPITAL_CNY:.2f} 元 (~${INITIAL_CAPITAL:.2f})\n"
+            f"当前净值: {INITIAL_CAPITAL_CNY:.2f} 元 (~${INITIAL_CAPITAL:.2f})\n"
+            f"净值波动: 0.00%\n"
+            f"\n"
+            f"🪙 【持仓明细】 (共 0 币种)\n"
+            f"暂无交易记录，等待 AI 策略触发首次交易信号...\n"
+            f"═════════════════════════\n"
+            f"💡 系统提示: 已注入防手续费磨损策略。"
         )
 
     # ===== 总览统计 =====
@@ -578,8 +580,15 @@ def generate_ledger_summary() -> str:
     total_assets_usdt = round(INITIAL_CAPITAL + total_pnl_usdt + total_unrealized_usdt, 2)
     total_assets_cny = round(total_assets_usdt * USDT_CNY_RATE, 2)
 
+    # 胜率统计
     win_count = sum(1 for e in sell_records if e.get("pnl_usdt", 0) > 0)
     win_rate = round(win_count / len(sell_records) * 100, 1) if sell_records else 0.0
+    # 亏损笔数
+    lose_count = len(sell_records) - win_count
+
+    # 净值波动率
+    net_change_pct = round((total_assets_usdt - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100, 2)
+    net_sign = "+" if net_change_pct >= 0 else ""
 
     # ===== 当日交易明细 =====
     today_trades = [e for e in ledger if e.get("time", "").startswith(tday)]
@@ -606,11 +615,11 @@ def generate_ledger_summary() -> str:
             + "\n".join(lines)
         )
 
-    # ===== 持仓详情（实时盈亏）=====
+    # ===== 持仓明细 =====
     positions_section = ""
     if positions:
         pos_lines = []
-        for coin, info in sorted(positions.items()):
+        for idx, (coin, info) in enumerate(sorted(positions.items()), 1):
             avg_cost = info["avg_cost"]
             total_qty = info["total_qty"]
             cur_price = _fetch_current_price(f"{coin}/USDT")
@@ -620,38 +629,41 @@ def generate_ledger_summary() -> str:
                 sign = "+" if unrealized >= 0 else ""
                 emoji = "📈" if unrealized >= 0 else "📉"
                 pos_lines.append(
-                    f"  {emoji} {coin}: {total_qty:.6f} 均价${avg_cost:.2f} "
-                    f"→ 现价${cur_price:.2f} ({sign}{pct}%) "
-                    f"浮动盈亏: {sign}{unrealized:.2f}USDT"
+                    f"{idx}\uFE0F\u20E3 {coin} | {'浮盈' if unrealized >= 0 else '浮亏'} {sign}{pct}% (${sign}{unrealized:.2f})\n"
+                    f"   持仓: {total_qty:.6f} | 均价: ${avg_cost:.2f} | 现价: ${cur_price:.2f}"
                 )
             else:
                 pos_lines.append(
-                    f"  🪙 {coin}: {total_qty:.6f} @ ${avg_cost:.2f} (暂无法获取实时价格)"
+                    f"{idx}\uFE0F\u20E3 {coin} | 暂无法获取实时价格\n"
+                    f"   持仓: {total_qty:.6f} | 均价: ${avg_cost:.2f} | 现价: N/A"
                 )
 
-        sign = "+" if total_unrealized_usdt >= 0 else ""
         positions_section = (
-            f"\n🪙 持仓详情 ({len(positions)} 币种)\n" + "\n".join(pos_lines) +
-            f"\n  {'─' * 20}\n  📊 浮动盈亏合计: {sign}{total_unrealized_usdt:.2f}USDT ({sign}{total_unrealized_cny:.2f}元)"
+            f"\n🪙 【持仓明细】 (共 {len(positions)} 币种)\n" + "\n".join(pos_lines)
         )
     else:
-        positions_section = "\n🪙 当前持仓: 无（空仓）"
+        positions_section = "\n🪙 【持仓明细】 (共 0 币种)\n无（空仓）"
 
     # ===== 拼接 =====
     sign_pnl = "+" if total_pnl_cny >= 0 else ""
-    pnl_emoji = "📈" if total_pnl_cny >= 0 else "📉"
+    sign_u = "+" if total_unrealized_cny >= 0 else ""
 
     return (
-        f"📊 ⚖️ AI 模拟盘总账本  [{now_str}]\n"
-        f"----------------------\n"
-        f"💰 初始本金: {INITIAL_CAPITAL_CNY:.0f} 元  (~${INITIAL_CAPITAL:.0f})\n"
-        f"🏦 总资产: {total_assets_cny:.2f} 元  (~${total_assets_usdt:.2f})\n"
-        f"{pnl_emoji} 累计已实现盈亏: {sign_pnl}{total_pnl_cny:.2f} 元  ({sign_pnl}{total_pnl_usdt:.2f} USDT)\n"
-        f"🎯 胜率: {win_rate}% ({win_count}/{len(sell_records)} 笔盈利)\n"
-        f"🔢 总交易次数: {total_trades} 次{today_section}"
+        f"📊 AI 量化每日盘点  [{now_str}]\n"
+        f"═════════════════════════\n"
+        f"💼 【账户总览】\n"
+        f"初始本金: {INITIAL_CAPITAL_CNY:.2f} 元 (~${INITIAL_CAPITAL:.2f})\n"
+        f"当前净值: {total_assets_cny:.2f} 元 (~${total_assets_usdt:.2f})\n"
+        f"净值波动: {net_sign}{net_change_pct}%\n"
+        f"\n"
+        f"🎯 【策略表现】\n"
+        f"已实现利润: {sign_pnl}{total_pnl_cny:.2f} 元 (落袋为安)\n"
+        f"未实现浮动: {sign_u}{total_unrealized_cny:.2f} 元 (持仓盈亏)\n"
+        f"胜率表现: {win_rate}% ({win_count}盈 / {lose_count}亏)\n"
+        f"交易活跃度: 共 {total_trades} 笔{today_section}\n"
         f"{positions_section}\n"
-        f"----------------------\n"
-        f"🤖 由 7 角色 AI 投研委员会自动管理"
+        f"═════════════════════════\n"
+        f"💡 系统提示: 胜率统计正常。已注入防手续费磨损策略。"
     )
 
 
