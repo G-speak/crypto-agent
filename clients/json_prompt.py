@@ -97,7 +97,7 @@ def parse_json_reply(reply: str) -> dict:
 
     # 如果 AI 裹了多余文字，用正则抓取第一个 { ... } 块
     # 使用非贪婪匹配，支持嵌套 JSON
-    m = re.search(r'\{.*?\}', text, re.DOTALL)
+    m = re.search(r'\{.*\}', text, re.DOTALL)
     if m:
         try:
             return json.loads(m.group())
@@ -105,14 +105,6 @@ def parse_json_reply(reply: str) -> dict:
             pass
 
     # 全失败则返回 HOLD
-    # 终极兜底：尝试从文本中直接抠 action 和 reason 字段
-    try:
-        act_m = re.search(r'"action"\s*:\s*"(BUY|SELL|HOLD)"', text, re.IGNORECASE)
-        rea_m = re.search(r'"reason"\s*:\s*"([^"]+)"', text, re.DOTALL)
-        if act_m:
-            return {"action": act_m.group(1).upper(), "reason": rea_m.group(1) if rea_m else "未识别原因"}
-    except:
-        pass
     return {"action": "HOLD", "reason": "AI 输出解析失败，默认持有"}
 
 
@@ -123,7 +115,7 @@ except ImportError:
     _FREE_MODEL_BLOCKED_UNTIL = 0.0
 
 
-def ask_ai_json(prompt: str, model: str = "auto") -> dict:
+def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
     """
     调用 AI（双平台动态路由 + 多模型轮询 + 每模型3次重试 + 免费冷却），
     返回解析后的 {"action": ..., "reason": ...}。
@@ -135,10 +127,13 @@ def ask_ai_json(prompt: str, model: str = "auto") -> dict:
     APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
     _log = print
 
-    # MODEL_POOL：付费优先（Yunwu），先试 JSON 稳定性最好的
+    # MODEL_POOL：免费优先，付费兜底
     JSON_MODEL_POOL = [
-        "deepseek-v3.2",        # [Yunwu付费] JSON 稳定性最佳（主力）
-        "deepseek-v4-flash",    # [Yunwu付费] 速度最快（备选）
+        "gpt-4.1-nano-free",    # [AIHubMix免费] 主力
+        "gpt-4.1-mini-free",    # [AIHubMix免费] 备用
+        "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰
+        "deepseek-v4-flash",    # [Yunwu付费] 付费兜底
+        "deepseek-v3.2",        # [Yunwu付费] JSON 稳定性最佳
         "MAI-DS-R1",            # [Yunwu付费] 推理兜底
     ]
 
@@ -176,7 +171,7 @@ def ask_ai_json(prompt: str, model: str = "auto") -> dict:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 500,
+            "max_tokens": 300,
         }
 
         for attempt in range(1, 4):
