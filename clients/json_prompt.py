@@ -121,6 +121,7 @@ def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
     返回解析后的 {"action": ..., "reason": ...}。
     """
     import requests, json, os, time
+    global _FREE_MODEL_BLOCKED_UNTIL
 
     from wechat_config import AI_API_KEY, YUNWU_API_KEY
     APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
