@@ -121,7 +121,6 @@ def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
     返回解析后的 {"action": ..., "reason": ...}。
     """
     import requests, json, os, time
-    global _FREE_MODEL_BLOCKED_UNTIL
 
     from wechat_config import AI_API_KEY, YUNWU_API_KEY
     APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
@@ -154,7 +153,7 @@ def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
             api_url = "https://api.aihubmix.com/v1/chat/completions"
             api_key = AI_API_KEY
         else:
-            api_url = "https://yunwu.ai/v1/chat/completions"
+            api_url = "https://api.openlux.ai/v1/chat/completions"
             api_key = YUNWU_API_KEY
 
         headers = {

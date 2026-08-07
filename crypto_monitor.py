@@ -325,17 +325,22 @@ MACD: {fmt(s['macd'], suffix="")}
 理由: [一句话]"""
 
 
+# ── 免费模型全局冷却 ──
+_FREE_MODEL_BLOCKED_UNTIL = 0.0  # 免费模型全部429后，在此时间戳之前都跳过
+
 def ask_ai(prompt, model="auto"):
     """调用AI分析，支持双平台动态路由 + 多模型轮询池 + 每模型3次重试"""
+    global _FREE_MODEL_BLOCKED_UNTIL
 
-    # MODEL_POOL：付费模型走 Yunwu（不限流，优先），含 free 的走 AIHubMix（备用）
+    # MODEL_POOL：免费优先（省钱），付费兜底
+    # 但如果免费模型全部429触发了冷却期，则跳过免费直接走付费
     MODEL_POOL = [
-        "deepseek-v4-flash",    # [Yunwu付费] 主力付费，速度最快，不限流
-        "deepseek-v3.2",        # [Yunwu付费] JSON 稳定性最佳
-        "MAI-DS-R1",            # [Yunwu付费] 微软微调推理兜底
-        "gpt-4.1-nano-free",    # [AIHubMix免费] 备用免费模型
+        "gpt-4.1-nano-free",    # [AIHubMix免费] 主力免费模型
         "gpt-4.1-mini-free",    # [AIHubMix免费] 备用免费模型
         "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰 Flash
+        "deepseek-v4-flash",    # [Yunwu付费] 付费兜底
+        "deepseek-v3.2",        # [Yunwu付费] 付费兜底
+        "MAI-DS-R1",            # [Yunwu付费] 付费兜底
     ]
 
     from wechat_config import AI_API_KEY, YUNWU_API_KEY
@@ -346,7 +351,13 @@ def ask_ai(prompt, model="auto"):
     else:
         candidate_models = [model]
 
+    # 检查免费模型冷却期：如果还在冷却中，直接剔除免费模型
+    if time.time() < _FREE_MODEL_BLOCKED_UNTIL:
+        candidate_models = [m for m in candidate_models if "free" not in m.lower()]
+        log(f"[ask_ai] 免费模型冷却至 {time.strftime('%H:%M', time.localtime(_FREE_MODEL_BLOCKED_UNTIL))}，跳过免费模型")
+
     last_exception = None
+    free_all_429 = True  # 跟踪本轮是否有免费模型成功
 
     for use_model in candidate_models:
         # 双平台路由：含 "free" 用 AIHubMix，否则用 Yunwu
@@ -354,7 +365,7 @@ def ask_ai(prompt, model="auto"):
             api_url = "https://api.aihubmix.com/v1/chat/completions"
             api_key = AI_API_KEY
         else:
-            api_url = "https://yunwu.ai/v1/chat/completions"
+            api_url = "https://api.openlux.ai/v1/chat/completions"
             api_key = YUNWU_API_KEY
 
         headers = {
@@ -382,13 +393,15 @@ def ask_ai(prompt, model="auto"):
                     headers=headers, json=payload, timeout=60
                 )
                 resp.raise_for_status()
+                # 免费模型成功则取消冷却标记
+                if "free" in use_model.lower():
+                    free_all_429 = False
                 return resp.json()["choices"][0]["message"]["content"]
             except requests.exceptions.HTTPError as e:
                 if resp is not None and resp.status_code == 429 and attempt < 3:
                     log(f"[ask_ai] 模型 {use_model} 429限流，等待3秒后第{attempt+1}次重试...")
                     time.sleep(3)
                     continue
-                # 非429或最后一次重试仍失败，记录异常并切模型
                 last_exception = e
                 log(f"[ask_ai] 模型 {use_model} HTTP错误: {e}，切换至下一模型")
                 break
@@ -400,6 +413,11 @@ def ask_ai(prompt, model="auto"):
                     continue
                 log(f"[ask_ai] 模型 {use_model} 重试3次均失败，切换至下一模型")
                 break
+
+    # 如果所有免费模型都 429，设置3小时冷却
+    if free_all_429 and any("free" in m.lower() for m in candidate_models):
+        _FREE_MODEL_BLOCKED_UNTIL = time.time() + 3 * 3600
+        log(f"[ask_ai] 所有免费模型均429，冻结免费模型至 {time.strftime('%H:%M', time.localtime(_FREE_MODEL_BLOCKED_UNTIL))}")
 
     # 全部模型都失败
     return f"⚠️ AI 分析调用失败: {last_exception}"

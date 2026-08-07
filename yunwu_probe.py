@@ -29,7 +29,7 @@ def probe_yunwu(timeout: float = 8.0) -> dict:
         if not YUNWU_API_KEY:
             return {"ok": False, "code": -1, "detail": "YUNWU_API_KEY 未配置"}
         resp = _req.post(
-            "https://yunwu.ai/v1/chat/completions",
+            "https://api.openlux.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {YUNWU_API_KEY}"},
             json={
                 "model": "deepseek-v3.2",
