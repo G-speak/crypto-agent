@@ -133,7 +133,7 @@ def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
         "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰
         "deepseek-v4-flash",    # [Yunwu付费] 付费兜底
         "deepseek-v3.2",        # [Yunwu付费] JSON 稳定性最佳
-        "MAI-DS-R1",            # [Yunwu付费] 推理兜底
+        "deepseek-r1",            # [Yunwu付费] 推理兜底
     ]
 
     if model == "auto":

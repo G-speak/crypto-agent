@@ -340,7 +340,7 @@ def ask_ai(prompt, model="auto"):
         "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰 Flash
         "deepseek-v4-flash",    # [Yunwu付费] 付费兜底
         "deepseek-v3.2",        # [Yunwu付费] 付费兜底
-        "MAI-DS-R1",            # [Yunwu付费] 付费兜底
+        "deepseek-r1",            # [Yunwu付费] 付费兜底
     ]
 
     from wechat_config import AI_API_KEY, YUNWU_API_KEY
