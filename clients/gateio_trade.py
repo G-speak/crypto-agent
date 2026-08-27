@@ -201,12 +201,99 @@ def _get_open_positions(ledger: list = None) -> dict:
     return result
 
 
+def _get_exchange():
+    """
+    初始化 ccxt Gate.io 交易所对象（实盘用）。
+
+    从 ~/.hermes/gateio.env 读取 API Key。
+    返回 exchange 对象；Key 缺失或初始化失败返回 None。
+    """
+    try:
+        import ccxt
+    except ImportError:
+        _logger.error("ccxt 未安装")
+        return None
+    env = _load_env()
+    api_key = env.get("GATEIO_API_KEY", "")
+    api_secret = env.get("GATEIO_API_SECRET", "")
+    if not api_key or not api_secret:
+        _logger.error("GATEIO_API_KEY 或 GATEIO_API_SECRET 未配置")
+        return None
+    try:
+        exchange = ccxt.gate({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+        })
+        return exchange
+    except Exception as e:
+        _logger.error(f"ccxt Gate.io 初始化失败: {e}")
+        return None
+
+
+def get_real_balance() -> dict:
+    """
+    获取真实账户余额（Gate.io /spot/accounts，经 ccxt fetch_balance）。
+
+    返回: {"USDT": {"free": 14.71, "used": 0, "total": 14.71}, "BTC": {...}, ...}
+    只包含非零余额的币种。失败返回 None。
+    """
+    exchange = _get_exchange()
+    if not exchange:
+        return None
+    try:
+        balance = exchange.fetch_balance()
+        result = {}
+        for coin, data in balance.items():
+            if not isinstance(data, dict):
+                continue
+            total = float(data.get("total", 0) or 0)
+            free = float(data.get("free", 0) or 0)
+            used = float(data.get("used", 0) or 0)
+            if total > 0 or free > 0 or used > 0:
+                result[coin] = {"free": free, "used": used, "total": total}
+        return result
+    except Exception as e:
+        _logger.error(f"获取真实余额失败: {e}")
+        return None
+
+
+def get_real_holdings() -> dict:
+    """
+    获取真实持仓明细（各币种可用数量）。
+
+    返回: {"BTC": {"quantity": 0.1, "avg_cost": 0, "total_cost": 0}, ...}
+    实盘无成本价数据时 avg_cost/total_cost 记 0（仅决策用数量）。
+    失败返回空字典。
+    """
+    balance = get_real_balance()
+    if not balance:
+        return {}
+    holdings = {}
+    for coin, data in balance.items():
+        if coin == "USDT":
+            continue
+        qty = float(data.get("total", 0) or 0)
+        if qty > 0:
+            holdings[coin] = {"quantity": qty, "avg_cost": 0.0, "total_cost": 0.0}
+    return holdings
+
+
 def _get_holdings(ledger: list = None) -> dict:
     """
-    从虚拟账本计算当前持仓（简化版，兼容旧调用方）。
-    返回: {"BTC": {"quantity": 0.1, "cost": 65000}, "ETH": {...}}
+    获取当前持仓。
+
+    实盘模式（DRY_RUN=False）：读取交易所真实持仓（真金白银）。
+    模拟模式（DRY_RUN=True）：从虚拟账本计算。
+
+    返回: {"BTC": {"quantity": 0.1, "avg_cost": 65000, "total_cost": 6500}, ...}
     空仓返回空字典。
     """
+    # ── 实盘模式：交易所真实持仓 ──
+    if not DRY_RUN:
+        return get_real_holdings()
+
+    # ── 模拟模式：虚拟账本 ──
     positions = _get_open_positions(ledger)
     holdings = {}
     for coin, info in positions.items():
@@ -456,6 +543,18 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
             # SELL 时 amount_usdt 无意义，传 0 标记为"按比例"
             amount_usdt = 0
 
+    # ── 实盘模式：BUY 金额基于真实可用 USDT（覆盖上方虚拟计算）──
+    if not DRY_RUN and action.upper() == "BUY" and percentage > 0:
+        real_balance = get_real_balance()
+        if real_balance:
+            available = float(real_balance.get("USDT", {}).get("free", 0) or 0)
+            amount_usdt = round(available * percentage / 100, 2)
+            _logger.info(f"[实盘] 真实可用 USDT={available:.2f}, BUY {percentage}% -> {amount_usdt} USDT")
+        else:
+            result["detail"] = "实盘 BUY 前获取真实余额失败，已取消下单（保护）"
+            _logger.error(result["detail"])
+            return result
+
     # ── DRY_RUN 模式：虚拟账本 ──
     if DRY_RUN:
         trade_result = _paper_trade(ccxt_symbol, coin_name, action, amount_usdt,
@@ -498,7 +597,17 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
 
         ticker = exchange.fetch_ticker(ccxt_symbol)
         current_price = ticker["last"]
-        raw_amount = amount_usdt / current_price
+
+        # ── 实盘下单数量计算 ──
+        if action.upper() == "SELL" and percentage > 0 and current_qty > 0:
+            # SELL 按真实持仓比例（percentage）
+            raw_amount = current_qty * percentage / 100
+            _logger.info(f"[实盘] SELL {percentage}% of 持仓 {current_qty:.8f} -> {raw_amount:.8f}")
+        elif action.upper() == "BUY" and percentage > 0:
+            # BUY 金额已在前面按真实可用 USDT 计算（amount_usdt）
+            raw_amount = amount_usdt / current_price
+        else:
+            raw_amount = amount_usdt / current_price
 
         if market["precision"]["amount"]:
             raw_amount = exchange.amount_to_precision(ccxt_symbol, raw_amount)
