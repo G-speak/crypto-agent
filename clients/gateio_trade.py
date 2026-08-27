@@ -47,8 +47,28 @@ _PAPER_LOG = os.path.expanduser("~/.hermes/paper_trading_log.json")
 # ── 初始资金配置 ──
 # 人民币计价，便于用户理解
 INITIAL_CAPITAL_CNY = 500.0       # 初始资金 500 元人民币（沙盘模拟用）
-USDT_CNY_RATE = 7.25              # 当前 USDT/CNY 汇率（约）
+USDT_CNY_RATE = 7.1972            # USDT/CNY 汇率默认值（≈ Gate.io 平台估值汇率，可在 live_account.json 校准）
 INITIAL_CAPITAL = round(INITIAL_CAPITAL_CNY / USDT_CNY_RATE, 2)  # ≈ 69 USDT（沙盘模拟用）
+
+
+def _get_usdt_cny_rate() -> float:
+    """
+    获取 USDT/CNY 汇率（与 Gate.io 平台估值对齐）。
+
+    优先从 ~/.hermes/live_account.json 的 usdt_cny_rate 字段读取
+    （用户可按 Gate.io App 显示的总资产估值校准），
+    文件缺失/异常时回退默认值 7.1972。
+    """
+    try:
+        if os.path.exists(_LIVE_CONFIG):
+            with open(_LIVE_CONFIG) as f:
+                cfg = json.load(f)
+            v = float(cfg.get("usdt_cny_rate", 0) or 0)
+            if 5 < v < 10:  # 合理性校验
+                return v
+    except Exception:
+        pass
+    return USDT_CNY_RATE
 
 # ── 实盘初始本金（真实充值金额）──
 DEFAULT_INITIAL_CAPITAL_USDT = 14.71  # 默认值；实际以 ~/.hermes/live_account.json 为准
@@ -702,12 +722,13 @@ def _generate_live_summary(now_str: str) -> str:
 
     # 总资产 = 可用 USDT + 持仓市值
     total_assets_usdt = round(usdt_total + holdings_value, 2)
-    total_assets_cny = round(total_assets_usdt * USDT_CNY_RATE, 2)
+    rate = _get_usdt_cny_rate()  # 与 Gate.io 平台估值对齐的汇率
+    total_assets_cny = round((usdt_total + holdings_value) * rate, 2)  # 用未舍入 USDT 计算，与 Gate 显示一致
 
-    # 净值波动（相对真实初始本金）
+    # 净值波动（相对真实初始本金，用未舍入值计算）
     init_usdt = _get_initial_capital_usdt()
-    init_cny = round(init_usdt * USDT_CNY_RATE, 2)
-    net_change_pct = round((total_assets_usdt - init_usdt) / init_usdt * 100, 2) if init_usdt > 0 else 0.0
+    init_cny = round(init_usdt * rate, 2)
+    net_change_pct = round(((usdt_total + holdings_value) - init_usdt) / init_usdt * 100, 2) if init_usdt > 0 else 0.0
     net_sign = "+" if net_change_pct >= 0 else ""
 
     pos_section = "\n".join(pos_lines) if pos_lines else "无（空仓）"
