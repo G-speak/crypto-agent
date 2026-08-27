@@ -46,9 +46,12 @@ _PAPER_LOG = os.path.expanduser("~/.hermes/paper_trading_log.json")
 
 # ── 初始资金配置 ──
 # 人民币计价，便于用户理解
-INITIAL_CAPITAL_CNY = 500.0       # 初始资金 500 元人民币
+INITIAL_CAPITAL_CNY = 500.0       # 初始资金 500 元人民币（沙盘模拟用）
 USDT_CNY_RATE = 7.25              # 当前 USDT/CNY 汇率（约）
-INITIAL_CAPITAL = round(INITIAL_CAPITAL_CNY / USDT_CNY_RATE, 2)  # ≈ 69 USDT
+INITIAL_CAPITAL = round(INITIAL_CAPITAL_CNY / USDT_CNY_RATE, 2)  # ≈ 69 USDT（沙盘模拟用）
+
+# ── 实盘初始本金（真实充值金额）──
+REAL_INITIAL_CAPITAL_USDT = 14.71  # 实盘账户真实充值金额
 
 
 # ==================== 虚拟账本（DRY_RUN 用）====================
@@ -641,6 +644,69 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
 
 # ==================== 账本报告（增强版）====================
 
+def _generate_live_summary(now_str: str) -> str:
+    """
+    实盘账户状态报告（DRY_RUN=False 时使用）。
+
+    读取真实余额 + 真实持仓 + 实时价格，计算总资产与净值波动。
+    本金 = REAL_INITIAL_CAPITAL_USDT（真实充值金额）。
+    """
+    balance = get_real_balance()
+    if not balance:
+        return (
+            f"📊 AI 量化每日盘点  [{now_str}]\n"
+            f"═════════════════════════\n"
+            f"⚠️ 实盘账户状态获取失败\n"
+            f"请检查 ~/.hermes/gateio.env 的 API 密钥\n"
+            f"═════════════════════════\n"
+            f"💡 系统提示: 实盘模式运行中。"
+        )
+
+    usdt_total = float(balance.get("USDT", {}).get("total", 0) or 0)
+
+    # 真实持仓 + 市值
+    holdings = get_real_holdings()
+    holdings_value = 0.0
+    pos_lines = []
+    for coin, info in sorted(holdings.items()):
+        qty = float(info.get("quantity", 0) or 0)
+        if qty <= 0:
+            continue
+        cur = _fetch_current_price(f"{coin}/USDT")
+        if cur > 0:
+            value = qty * cur
+            holdings_value += value
+            pos_lines.append(f"  {coin}: {qty:.6f} | 现价 ${cur:.2f} | 市值 ${value:.2f}")
+        else:
+            pos_lines.append(f"  {coin}: {qty:.6f} | 现价 N/A")
+
+    # 总资产 = 可用 USDT + 持仓市值
+    total_assets_usdt = round(usdt_total + holdings_value, 2)
+    total_assets_cny = round(total_assets_usdt * USDT_CNY_RATE, 2)
+
+    # 净值波动（相对真实初始本金）
+    init_usdt = REAL_INITIAL_CAPITAL_USDT
+    init_cny = round(init_usdt * USDT_CNY_RATE, 2)
+    net_change_pct = round((total_assets_usdt - init_usdt) / init_usdt * 100, 2) if init_usdt > 0 else 0.0
+    net_sign = "+" if net_change_pct >= 0 else ""
+
+    pos_section = "\n".join(pos_lines) if pos_lines else "无（空仓）"
+
+    return (
+        f"📊 AI 量化每日盘点  [{now_str}]\n"
+        f"═════════════════════════\n"
+        f"💼 【账户总览】\n"
+        f"初始本金: {init_cny:.2f} 元 (~${init_usdt:.2f})\n"
+        f"当前净值: {total_assets_cny:.2f} 元 (~${total_assets_usdt:.2f})\n"
+        f"净值波动: {net_sign}{net_change_pct}%\n"
+        f"\n"
+        f"🪙 【持仓明细】 (共 {len(holdings)} 币种)\n"
+        f"{pos_section}\n"
+        f"═════════════════════════\n"
+        f"💡 系统提示: 实盘模式运行中。"
+    )
+
+
 def generate_ledger_summary() -> str:
     """
     读取虚拟账本，生成总资产状态文字报告（人民币计价）。
@@ -650,9 +716,17 @@ def generate_ledger_summary() -> str:
       - 当日交易明细（BUY/SELL 活动）
       - 当前持仓详情（币种、数量、均价、现价、浮动盈亏）
       - 已平仓交易汇总
+
+    实盘模式（DRY_RUN=False）：读取真实账户余额与持仓。
     """
-    ledger = _load_ledger()
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M")
+
+    # ── 实盘模式：真实账户报告 ──
+    if not DRY_RUN:
+        return _generate_live_summary(now_str)
+
+    # ── 模拟模式：虚拟账本 ──
+    ledger = _load_ledger()
     tday = _today_str()
 
     if not ledger:
