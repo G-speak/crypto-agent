@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta, date
 from collections import OrderedDict
 
 # ── 全局安全开关 ──
-DRY_RUN = True
+DRY_RUN = False
 
 _logger = logging.getLogger("gateio_trade")
 _logger.setLevel(logging.INFO)
@@ -51,7 +51,27 @@ USDT_CNY_RATE = 7.25              # 当前 USDT/CNY 汇率（约）
 INITIAL_CAPITAL = round(INITIAL_CAPITAL_CNY / USDT_CNY_RATE, 2)  # ≈ 69 USDT（沙盘模拟用）
 
 # ── 实盘初始本金（真实充值金额）──
-REAL_INITIAL_CAPITAL_USDT = 14.71  # 实盘账户真实充值金额
+DEFAULT_INITIAL_CAPITAL_USDT = 14.71  # 默认值；实际以 ~/.hermes/live_account.json 为准
+_LIVE_CONFIG = os.path.expanduser("~/.hermes/live_account.json")
+
+
+def _get_initial_capital_usdt() -> float:
+    """
+    读取实盘初始本金（真实充值金额）。
+
+    优先从 ~/.hermes/live_account.json 的 initial_capital_usdt 字段读取
+    （充值后可手动更新该文件），文件缺失/异常时回退默认值。
+    """
+    try:
+        if os.path.exists(_LIVE_CONFIG):
+            with open(_LIVE_CONFIG) as f:
+                cfg = json.load(f)
+            v = float(cfg.get("initial_capital_usdt", 0) or 0)
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return DEFAULT_INITIAL_CAPITAL_USDT
 
 
 # ==================== 虚拟账本（DRY_RUN 用）====================
@@ -685,7 +705,7 @@ def _generate_live_summary(now_str: str) -> str:
     total_assets_cny = round(total_assets_usdt * USDT_CNY_RATE, 2)
 
     # 净值波动（相对真实初始本金）
-    init_usdt = REAL_INITIAL_CAPITAL_USDT
+    init_usdt = _get_initial_capital_usdt()
     init_cny = round(init_usdt * USDT_CNY_RATE, 2)
     net_change_pct = round((total_assets_usdt - init_usdt) / init_usdt * 100, 2) if init_usdt > 0 else 0.0
     net_sign = "+" if net_change_pct >= 0 else ""
