@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 yunwu.ai 连通性定时探测脚本
-每天 0/6/12/18 点由 crontab 调用，记录 yunwu 是否可用。
+每天 0/6/12/18 点由 crontab 调用，记录 openlux 是否可用。
 
 日志文件: ~/.hermes/logs/yunwu_probe.log
 用法: python3 yunwu_probe.py
@@ -23,7 +23,7 @@ def _bjt_now_str() -> str:
 
 
 def probe_yunwu(timeout: float = 8.0) -> dict:
-    """发最小 chat 请求探测 yunwu，返回 {ok, code, detail}"""
+    """发最小 chat 请求探测 openlux，返回 {ok, code, detail}"""
     try:
         from wechat_config import YUNWU_API_KEY
         if not YUNWU_API_KEY:
@@ -54,7 +54,7 @@ def main():
     # 追加日志
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     with open(LOG_FILE, "a") as f:
-        f.write(f"[{now_str}] yunwu {status_cn} (code={result['code']}) {result['detail']}\n")
+        f.write(f"[{now_str}] openlux {status_cn} (code={result['code']}) {result['detail']}\n")
 
     # 更新状态文件（记录每次探测结果，供后续恢复判断）
     try:
@@ -70,7 +70,7 @@ def main():
     except Exception:
         pass
 
-    print(f"[{now_str}] yunwu {status_cn} (code={result['code']}) {result['detail']}")
+    print(f"[{now_str}] openlux {status_cn} (code={result['code']}) {result['detail']}")
 
 
 if __name__ == "__main__":

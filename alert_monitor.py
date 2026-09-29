@@ -131,6 +131,16 @@ def check_alerts():
 def push_alerts(alerts):
     if not alerts:
         return
+
+    # ══════════════════════════════════════════════════════════
+    # yunwu.ai 连通性探测：不可用时跳过本轮全部推送，
+    # 避免向用户推送一堆 "AI 调用失败" 的无效消息。
+    # （任何 HTTP 响应都算网络可达；只有超时/断连才算不可用）
+    # ══════════════════════════════════════════════════════════
+    if not _is_yunwu_ready():
+        log(f"⛔ yunwu.ai 不可达，跳过本轮 {len(alerts)} 条预警推送（AI 不可用）")
+        return
+
     from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     from wechat_push import send_simple_message
     import requests as _req, json as _json
@@ -252,6 +262,8 @@ def push_alerts(alerts):
                 short_text = "\n".join(lines[start:]).strip()
                 short_reply = short_text if short_text else text
                 ai_text = short_reply
+                if not ai_text or ai_text.strip() == "":
+                    ai_text = f"{coin_name} 当前价 ${data.get('price',0):,.2f}，RSI {data.get('rsi',50):.1f}，24h {data.get('change_24h',0):+.2f}%，暂无明显方向"
 
             # 新闻内容去重（_fetch_coin_news 已在决策前完成搜索和缓存）
             if news_text:
@@ -308,10 +320,43 @@ def get_dry_run_status() -> bool:
         return True  # 模块不存在时保守为 True
 
 
+def _is_yunwu_ready(timeout: float = 5.0) -> bool:
+    """
+    探测 yunwu.ai 是否可用（AI 主通道）。
+
+    方式：发一个最小 chat 请求，status_code == 200 才算可用。
+    - 超时/断连（被墙）→ False，跳过推送
+    - 返回 401/400/5xx → 网络可达但服务异常，同样视为不可用（避免推失败消息）
+
+    注意：v2 的 7 角色委员会和 json 决策都用 Yunwu 付费通道，
+    因此只需探测 openlux，不必再探测 AIHubMix 兜底。
+    """
+    import requests as _req
+    try:
+        from wechat_config import YUNWU_API_KEY
+        resp = _req.post(
+            "https://api.openlux.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {YUNWU_API_KEY}"},
+            json={
+                "model": "deepseek-v3.2",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 5,
+                "temperature": 0,
+            },
+            timeout=timeout,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        log(f"[openlux探测] 不可用: {str(e)[:80]}")
+        return False
+
+
 def _fetch_coin_news(coin_name, news_cache, cache_file, today):
-    """按币种+按天搜索新闻（与原来逻辑一致）"""
+    """从 CoinTelegraph RSS 获取真实新闻 + 免费模型提炼"""
     import requests as _req
     import json
+    import re as _re
+    import xml.etree.ElementTree as ET
     cache_key = f"news_{coin_name}_{today}"
     now = time.time()
 
@@ -320,41 +365,83 @@ def _fetch_coin_news(coin_name, news_cache, cache_file, today):
     if cached:
         return cached.replace("**", "")
 
-    # 未命中则搜索
+    # 从 CoinTelegraph RSS 抓取新闻
+    raw_news = []
     try:
-        from wechat_config import AI_API_KEY
-        APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
-        news_prompt = (
-            f"现在是2026年6月。请搜索{coin_name}今天的最新新闻，"
-            f"只列出该币种自身相关的具体事件（含来源），不要混入其他币种或大盘行情。"
-            f"控制在400字以内，必须搜索实时新闻。"
-        )
-        headers = {
-            "Authorization": f"Bearer {AI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        if APP_CODE:
-            headers["APP-Code"] = APP_CODE
-        resp = _req.post(
-            "https://api.aihubmix.com/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "gpt-4o-mini-search-preview",
-                "messages": [{"role": "user", "content": news_prompt}],
-            },
-            timeout=25,
-        )
-        if resp.status_code == 200:
-            text = resp.json()["choices"][0]["message"]["content"].replace("**", "")
-            news_cache[cache_key] = {"text": text, "time": now}
+        urls = [
+            "https://cointelegraph.com/rss",
+        ]
+        rss_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        
+        for url in urls:
+            try:
+                r = _req.get(url, headers=rss_headers, timeout=10)
+                if r.status_code == 200:
+                    root = ET.fromstring(r.content)
+                    items = root.findall('./channel/item')
+                    coin_upper = coin_name.upper()
+                    matched = []
+                    for item in items:
+                        title = item.find('title').text if item.find('title') is not None else ""
+                        desc = item.find('description').text if item.find('description') is not None else ""
+                        raw = f"{title} {desc}"
+                        if coin_upper in raw.upper():
+                            matched.append(raw)
+                    top3 = matched[:3] if matched else []
+                    for news in top3:
+                        clean = _re.sub(r'<[^>]+>', '', news).strip()[:500]
+                        raw_news.append(clean)
+                    if top3:
+                        break
+            except:
+                continue
+
+        news_text = "\n---\n".join(raw_news) if raw_news else ""
+
+        # 用免费模型提炼（仅当有原始新闻时）
+        if news_text:
+            from wechat_config import AI_API_KEY
+            APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
+            prompt = (
+                "You are a crypto analyst. Here are the latest real news just fetched:\n"
+                + news_text + "\n"
+                + "Based on these real news, briefly summarize market sentiment for "
+                + coin_name + " in Chinese, within 150 chars."
+            )
+            headers = {
+                "Authorization": f"Bearer {AI_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            if APP_CODE:
+                headers["APP-Code"] = APP_CODE
+            resp = _req.post(
+                "https://api.aihubmix.com/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "gpt-4.1-nano-free",
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                text = resp.json()["choices"][0]["message"]["content"].replace("**", "")
+                news_cache[cache_key] = {"text": text, "time": now}
+                with open(cache_file, "w") as f:
+                    json.dump(news_cache, f)
+                log(f"已获取真实新闻并缓存{coin_name}的市场点评")
+                return text
+
+        # AI 调用失败或没有新闻时，返回原始新闻
+        if raw_news:
+            fallback = "\U0001f4f0 Latest News:\n" + "\n".join(raw_news[:2])
+            news_cache[cache_key] = {"text": fallback, "time": now}
             with open(cache_file, "w") as f:
                 json.dump(news_cache, f)
-            log(f"已搜索并缓存{coin_name}的新闻")
-            return text
-        else:
-            log(f"新闻搜索失败({coin_name}): {resp.status_code}")
+            return fallback
+            
     except Exception as e:
-        log(f"新闻搜索异常({coin_name}): {e}")
+        log(f"获取新闻异常({coin_name}): {e}")
+
     return ""
 
 

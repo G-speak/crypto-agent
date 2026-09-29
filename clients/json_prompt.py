@@ -115,7 +115,7 @@ except ImportError:
     _FREE_MODEL_BLOCKED_UNTIL = 0.0
 
 
-def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
+def ask_ai_json(prompt: str, model: str = "auto") -> dict:
     """
     调用 AI（双平台动态路由 + 多模型轮询 + 每模型3次重试 + 免费冷却），
     返回解析后的 {"action": ..., "reason": ...}。
@@ -127,14 +127,11 @@ def ask_ai_json(prompt: str, model: str = "gpt-4.1-nano-free") -> dict:
     APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
     _log = print
 
-    # MODEL_POOL：免费优先，付费兜底
+    # MODEL_POOL：OpenLux 付费优先（deepseek-v3.2 JSON 稳定性最佳）
     JSON_MODEL_POOL = [
-        "gpt-4.1-nano-free",    # [AIHubMix免费] 主力
-        "gpt-4.1-mini-free",    # [AIHubMix免费] 备用
-        "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰
-        "deepseek-v4-flash",    # [Yunwu付费] 付费兜底
-        "deepseek-v3.2",        # [Yunwu付费] JSON 稳定性最佳
-        "deepseek-r1",            # [Yunwu付费] 推理兜底
+        "deepseek-v3.2",        # [OpenLux付费] JSON 稳定性最佳（主力）
+        "deepseek-v4-flash",    # [OpenLux付费] 速度最快（备选）
+        "deepseek-r1",          # [OpenLux付费] 推理兜底
     ]
 
     if model == "auto":

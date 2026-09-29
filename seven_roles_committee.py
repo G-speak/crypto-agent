@@ -18,17 +18,21 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # 接入 Hermes 核心组件
 from wechat_push import send_simple_message
-from clients.gateio_trade import execute_order, _get_holdings, DRY_RUN
+from clients.gateio_trade import execute_order, _get_holdings, DRY_RUN, get_real_balance, _get_initial_capital_usdt
 
 # 从配置文件读取 Yunwu API KEY
-YUNWU_API_KEY = "sk-fkyjAQt1zP02Q5YZ3TQM3CEQ0hYcGwpWotcPSpY26zV0GDgW"
+YUNWU_API_KEY = os.environ.get("YUNWU_API_KEY", "")   # 公开仓库不落真实密钥；服务器从 clients/mom.json 读取
 try:
     from wechat_config import YUNWU_API_KEY as _cfg_key
     if _cfg_key: YUNWU_API_KEY = _cfg_key
 except:
     pass
 
-YUNWU_URL = "https://yunwu.ai/v1/chat/completions"
+YUNWU_URL = "https://api.openlux.ai/v1/chat/completions"
+
+# 单笔买入仓位上限（正常比例风控）。2026-09-30 取消“实盘测试强制满仓 100%”的旧铁律，
+# 改为由风控经理按可用资金给 10%-50%；超过上限的指令在这里兜底压回上限。
+MAX_BUY_PCT = 50
 
 # ====== 1. 核心提示词矩阵 ======
 AGENT_PROMPTS = {
@@ -58,11 +62,17 @@ AGENT_PROMPTS = {
 2. 结合当前的【真实持仓情况】（空仓还是满仓）。
 3. 做出最终的裁决。
 铁律：如果你当前是【空仓】，绝对不允许给出 SELL 建议；如果当前【已有持仓】，绝对不允许给出 BUY 建议。矛盾或不确定时输出 HOLD。
-输出要求：给出你最终拍板的决策（BUY/SELL/HOLD）以及深度思考理由，不超过200字。""",
+4. 【抗磨损铁律】：真实交易所存在单边 0.1% 的手续费。如果判断上涨空间不足 3%，严禁给出 BUY 建议，宁可错过绝不做无效交易！
+5. 【仓位管理】：按【当前状态】里给出的账户可用资金计算仓位。单次 BUY 的建仓比例 (percentage) 为可用资金的 10%-50%，且单笔金额不低于 5 USDT（交易所最小下单门槛）；不得以“凑门槛”为由放大到高仓位。
+6. 【实盘风控红线】：严禁满仓梭哈，任何情况下 BUY 的 percentage 不得超过 50。低确定性轻仓（10%-15%）、中等确定性（20%-35%）、高确定性重仓（40%-50%）。不确定时宁可轻仓或 HOLD，保留现金。
+7. 【扩大盈亏比】：严禁在只有微薄利润（如 1%）时就轻易 SELL 止盈，必须耐心持有到核心阻力位或趋势反转才可平仓。
+8. 【卖出仓位】：SELL 的 percentage 表示卖出占【当前持仓量】的比例，趋势反转/止损时可以给 100（清仓），普通减仓给 30-60。
+核心要求：BUY 必须给出 10-50 的仓位百分比；SELL 给出 30-100 的仓位百分比；HOLD 时为 0。
+输出要求：给出你最终拍板的决策（BUY/SELL/HOLD）、仓位百分比（整数，HOLD 时为 0）以及深度思考理由，不超过200字。""",
 
     "trader": """你是一个没有感情的API交易执行机器。
 你的任务：阅读风控经理的最终裁决，将其严格转化为JSON格式。
-输出格式要求：{"action": "BUY"或"SELL"或"HOLD", "reason": "一句话理由"}
+    输出格式要求：{"action": "BUY"或"SELL"或"HOLD", "percentage": 整数（BUY时为10-50，SELL时为30-100，HOLD时为0）, "reason": "一句话理由"}
 绝对不要输出任何多余的Markdown符号，只输出字典本身！"""
 }
 
@@ -103,27 +113,43 @@ def fetch_real_crypto_data(gate_symbol):
         return None, 0
 
 def fetch_real_crypto_news(coin_name):
-    try:
-        url = "https://cointelegraph.com/rss"
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        root = ET.fromstring(resp.content)
-        items = root.findall('./channel/item')
-        
-        relevant_news = []
-        for item in items:
-            title = item.find('title').text if item.find('title') is not None else ""
-            if coin_name.upper() in title.upper():
-                relevant_news.append(title)
-            if len(relevant_news) >= 3: break
-                
-        if not relevant_news:
-            for item in items[:2]:
+    """从 CoinTelegraph RSS 获取真实新闻，带多源轮询"""
+    urls = [
+        "https://cointelegraph.com/rss",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            items = root.findall('./channel/item')
+            
+            relevant_news = []
+            for item in items:
                 title = item.find('title').text if item.find('title') is not None else ""
-                relevant_news.append(title)
-                
-        return "\n".join([f"- {t}" for t in relevant_news]) if relevant_news else "暂无新闻"
-    except:
-        return "暂无新闻"
+                # 清理 HTML 标签
+                import re as _re
+                clean_title = _re.sub(r'<[^>]+>', '', title).strip()
+                if coin_name.upper() in clean_title.upper():
+                    relevant_news.append(clean_title)
+                if len(relevant_news) >= 3:
+                    break
+            
+            if not relevant_news:
+                for item in items[:2]:
+                    title = item.find('title').text if item.find('title') is not None else ""
+                    clean_title = _re.sub(r'<[^>]+>', '', title).strip()
+                    relevant_news.append(clean_title)
+            
+            result = "\n".join([f"- {t}" for t in relevant_news]) if relevant_news else ""
+            if result:
+                return result
+        except Exception as e:
+            continue
+    
+    return ""
 
 # ====== 3. AI 调度 ======
 def ask_agent(role_name, prompt, model="deepseek-v3.2", max_retries=3):
@@ -162,11 +188,13 @@ def parse_json_safely(text):
 def run_committee(coin_name, symbol, radar_reason=""):
     """由 alert_monitor 触发的深度投研"""
     print(f"🚀 [7角色委员会] 被唤醒，开始深度评估 {coin_name}...")
-    
+    send_simple_message(f"🚀 {coin_name} 触发雷达信号，7 角色投研委员会启动...")
+
     # 转换 symbol 格式给 Gate 数据抓取用
     gate_symbol = symbol.replace("usdt", "_USDT").upper()
     market_data, current_price = fetch_real_crypto_data(gate_symbol)
     if not market_data: 
+        send_simple_message(f"❌ {coin_name} 数据抓取失败，委员会解散")
         print("❌ 数据抓取失败，委员会解散")
         return
         
@@ -177,55 +205,81 @@ def run_committee(coin_name, symbol, radar_reason=""):
     coin_base = coin_name.upper()
     current_qty = holdings.get(coin_base, {}).get("quantity", 0.0)
     mock_position = f"已持仓 (数量: {current_qty})" if current_qty > 0 else "空仓 (0)"
-    
+
+    # 可用资金（供风控经理按正常比例算仓位：实盘读真实余额，失败则退回配置本金）
+    try:
+        if DRY_RUN:
+            avail_usdt = float(_get_initial_capital_usdt())
+        else:
+            avail_usdt = float((get_real_balance().get("USDT") or {}).get("free", 0) or 0)
+        if avail_usdt <= 0:
+            avail_usdt = float(_get_initial_capital_usdt())
+    except Exception as _e:
+        print(f"⚠️ 读取可用资金失败，退回配置本金: {_e}")
+        avail_usdt = float(_get_initial_capital_usdt())
+
     comprehensive_prompt = f"【数据】\n{market_data}\n\n【新闻】\n{news_data}"
 
-    # ===== 开始开会 =====
+    # ===== ⏳ 第一层：情报搜集分析中... =====
+    send_simple_message(f"⏳ 第一层：情报搜集分析中...\n📈【技术分析师】🔍 分析 {coin_name} 技术指标...\n📰【基本面分析师】🔍 解读最新消息面...\n🎭【情绪分析师】🔍 嗅探市场情绪...")
     tech = ask_agent("tech_analyst", market_data, "deepseek-v4-flash")
     fund = ask_agent("fund_analyst", comprehensive_prompt, "deepseek-v4-flash")
     sent = ask_agent("sent_analyst", comprehensive_prompt, "deepseek-v4-flash")
     
+    # ===== ⏳ 第二层：红蓝激烈对抗中... =====
+    send_simple_message(f"⏳ 第二层：红蓝激烈对抗中...\n🐂【多头研究员】🛡️ 构建做多逻辑\n🐻【空头研究员】⚔️ 构建做空逻辑")
     combined = f"技术面：{tech}\n基本面：{fund}\n情绪面：{sent}"
     bull = ask_agent("bull_researcher", combined, "deepseek-v3.2")
     bear = ask_agent("bear_researcher", combined, "deepseek-v3.2")
     
-    debate = f"多头：{bull}\n空头：{bear}\n当前状态：{mock_position}。请严格遵守铁律。"
+    # ===== ⏳ 第三层：风控大脑思考中... =====
+    send_simple_message(f"⏳ 第三层：风控大脑思考中...\n⚖️【风控经理】🧠 综合多空辩论与持仓状态进行裁决")
+    debate = f"多头：{bull}\n空头：{bear}\n当前状态：{mock_position}。账户可用资金约 {avail_usdt:.2f} USDT。请严格遵守铁律。"
     risk = ask_agent("risk_manager", debate, "deepseek-v3.2")
     
+    # ===== ⏳ 第四层：交易员执行... =====
+    send_simple_message(f"⏳ 第四层：交易员执行...\n👨‍💻【交易员】⚙️ 将风控裁决转化为交易指令")
     trade_cmd = parse_json_safely(ask_agent("trader", risk, "deepseek-v3.2"))
     action = trade_cmd.get("action", "HOLD").upper()
     reason = trade_cmd.get("reason", "无")
+    percentage = trade_cmd.get("percentage", 0)
+    if not isinstance(percentage, int) or percentage < 0 or percentage > 100:
+        percentage = 0
+    elif action == "BUY" and percentage > MAX_BUY_PCT:
+        # 正常比例风控兜底：买入仓位超上限时压回（SELL 不受限，允许 100 清仓）
+        print(f"⚠️ BUY 仓位 {percentage}% 超过上限 {MAX_BUY_PCT}%，已压回")
+        percentage = MAX_BUY_PCT
     
     # ===== 执行决策并记录账本 =====
     trade_result = {"action": "HOLD", "pnl_pct": 0, "pnl_usdt": 0}
     pnl_msg = f"⚪ 投研判定风险过高，维持观望。\n(初筛理由: {radar_reason})"
     
     if action in ["BUY", "SELL"]:
-        # 真正调用 Hermes 的原生下单接口（DRY_RUN 会拦截并写账本）
-        trade_result = execute_order(symbol, action, amount_usdt=10, coin_name=coin_name)
+        trade_result = execute_order(symbol, action, amount_usdt=10, coin_name=coin_name, percentage=percentage)
         
         dr_note = " (DRY RUN 模拟)" if DRY_RUN else ""
+        fill_price = trade_result.get("fill_price", 0)
+        qty = trade_result.get("quantity", 0)
         if action == "BUY":
-            pnl_msg = f"🟢 深度判定通过！已下达买单{dr_note}"
+            pnl_msg = f"🟢 深度判定买入！(动用仓位 {percentage}%，成交价 ${fill_price:.2f}，数量 {qty}){dr_note}"
         elif action == "SELL":
             pnl_pct = trade_result.get("pnl_pct", 0)
             sign = "+" if pnl_pct > 0 else ""
-            pnl_msg = f"🔴 深度判定卖出！已下达卖单{dr_note}\n💸 模拟平仓收益: {sign}{pnl_pct:.2f}%"
+            pnl_msg = f"🔴 深度判定卖出！(动用仓位 {percentage}%，成交价 ${fill_price:.2f}，数量 {qty}){dr_note}\n💸 模拟平仓收益: {sign}{pnl_pct:.2f}%"
     
-    # ===== 组装微信报告 =====
+    # ===== 组装最终微信报告（完整输出，不截断） =====
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "⚪")
     wechat_text = (
         f"🤖 7角色深度投研报告 [{coin_name}]\n"
         f"----------------------\n"
-        f"🐂 多头核心逻辑:\n{bull[:120]}...\n\n"
-        f"🐻 空头核心逻辑:\n{bear[:120]}...\n"
+        f"🐂 多头核心逻辑:\n{bull}\n\n"
+        f"🐻 空头核心逻辑:\n{bear}\n"
         f"----------------------\n"
         f"⚖️ 风控最终拍板:\n{emoji} 决策: {action}\n"
         f"💡 理由: {reason}\n\n"
         f"💼 账户动态:\n{pnl_msg}"
     )
     
-    # 推送给微信
     send_simple_message(wechat_text)
     print(f"✅ {coin_name} 委员会决议已推送。")
 
