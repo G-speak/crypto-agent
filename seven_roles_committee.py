@@ -21,7 +21,7 @@ from wechat_push import send_simple_message
 from clients.gateio_trade import execute_order, _get_holdings, DRY_RUN, get_real_balance, _get_initial_capital_usdt
 
 # 从配置文件读取 Yunwu API KEY
-YUNWU_API_KEY = os.environ.get("YUNWU_API_KEY", "")   # 公开仓库不落真实密钥；服务器从 clients/mom.json 读取
+YUNWU_API_KEY = os.environ.get("YUNWU_API_KEY", "")   # 不落真实密钥；服务器从 clients/mom.json 读取
 try:
     from wechat_config import YUNWU_API_KEY as _cfg_key
     if _cfg_key: YUNWU_API_KEY = _cfg_key
@@ -256,16 +256,28 @@ def run_committee(coin_name, symbol, radar_reason=""):
     
     if action in ["BUY", "SELL"]:
         trade_result = execute_order(symbol, action, amount_usdt=10, coin_name=coin_name, percentage=percentage)
-        
+
         dr_note = " (DRY RUN 模拟)" if DRY_RUN else ""
-        fill_price = trade_result.get("fill_price", 0)
-        qty = trade_result.get("quantity", 0)
-        if action == "BUY":
-            pnl_msg = f"🟢 深度判定买入！(动用仓位 {percentage}%，成交价 ${fill_price:.2f}，数量 {qty}){dr_note}"
-        elif action == "SELL":
-            pnl_pct = trade_result.get("pnl_pct", 0)
+        ok = bool(trade_result.get("success"))
+        detail = str(trade_result.get("detail") or "").strip()
+        fill_price = trade_result.get("fill_price", 0) or 0
+        qty = trade_result.get("quantity", 0) or 0
+        act_cn = "买入" if action == "BUY" else "卖出"
+        act_emoji = "🟢" if action == "BUY" else "🔴"
+
+        if not ok:
+            # 下单失败必须如实说明并带上原因，绝不能显示成"已成交 0"
+            pnl_msg = (f"⚠️ 深度判定{act_cn}，但未能成交（拟用仓位 {percentage}%）{dr_note}\n"
+                       f"❗ 原因: {detail or '下单返回失败，详见服务器日志'}")
+        elif action == "BUY":
+            pnl_msg = (f"{act_emoji} 深度判定买入，已成交！\n"
+                       f"   动用仓位 {percentage}% ｜ 成交价 ${fill_price:,.2f} ｜ 数量 {qty} ｜ 约 {fill_price * qty:.2f} USDT{dr_note}")
+        else:
+            pnl_pct = trade_result.get("pnl_pct", 0) or 0
             sign = "+" if pnl_pct > 0 else ""
-            pnl_msg = f"🔴 深度判定卖出！(动用仓位 {percentage}%，成交价 ${fill_price:.2f}，数量 {qty}){dr_note}\n💸 模拟平仓收益: {sign}{pnl_pct:.2f}%"
+            tail = f"\n💸 模拟平仓收益: {sign}{pnl_pct:.2f}%" if (DRY_RUN and pnl_pct != 0) else ""
+            pnl_msg = (f"{act_emoji} 深度判定卖出，已成交！\n"
+                       f"   动用仓位 {percentage}% ｜ 成交价 ${fill_price:,.2f} ｜ 数量 {qty}{dr_note}{tail}")
     
     # ===== 组装最终微信报告（完整输出，不截断） =====
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "⚪")

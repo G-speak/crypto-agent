@@ -655,11 +655,18 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
         if market["precision"]["amount"]:
             raw_amount = exchange.amount_to_precision(ccxt_symbol, raw_amount)
 
-        order = exchange.create_market_order(
-            symbol=ccxt_symbol,
-            side=side,
-            amount=float(raw_amount),
-        )
+        # ⚠️ Gate.io 的市价买单必须带 price（或设 createMarketBuyOrderRequiresPrice=False 并把
+        # amount 换成"要花多少 USDT"），否则 ccxt 直接抛 InvalidOrder。
+        # 2026-10-07 实测：实盘 BUY 一直卡在这里 → 从未成交（账本/推送却显示"买入 0"）。
+        order_params = {
+            "symbol": ccxt_symbol,
+            "side": side,
+            "amount": float(raw_amount),
+        }
+        if side == "buy":
+            order_params["price"] = float(current_price)   # 让 ccxt 用 amount*price 换算出花费的 USDT
+
+        order = exchange.create_market_order(**order_params)
 
         msg = (
             f"✅ 实盘下单成功\n"

@@ -230,6 +230,13 @@ def push_alerts(alerts):
                 # ── 执行下单（DRY_RUN 保护），捕获返回值用于 PnL ──
                 trade_result = _execute_trade(coin_name, symbol, action)
 
+                # 下单结果提示：失败必须如实带原因，不能只报"买入信号"（2026-10-07 教训）
+                trade_note = ""
+                if action in ("BUY", "SELL") and trade_result:
+                    if not trade_result.get("success"):
+                        _detail = str(trade_result.get("detail") or "下单失败，详见服务器日志").strip()
+                        trade_note = f"\n{chr(0x26a0)}{chr(0xfe0f)} 下单未成功: {_detail[:120]}"
+
                 # 提取 PnL（仅 SELL + 有盈亏时）
                 pnl_str = ""
                 if action == "SELL" and trade_result:
@@ -238,13 +245,14 @@ def push_alerts(alerts):
                     if pnl_pct != 0:
                         sign = "+" if pnl_pct >= 0 else ""
                         direction = "赚" if pnl_pct >= 0 else "亏"
-                        pnl_str = f"\n{chr(0x1f9f8)} 模拟平仓收益: {sign}{pnl_pct}% (大约{direction} {abs(pnl_usdt):.2f} USDT)"
+                        _label = "模拟平仓收益" if dr else "平仓盈亏"
+                        pnl_str = f"\n{chr(0x1f9f8)} {_label}: {sign}{pnl_pct}% (大约{direction} {abs(pnl_usdt):.2f} USDT)"
 
                 decision_text = (
                     f"---\n"
                     f"{chr(0x1f4a4)} {coin_name} 交易决策\n"
                     f"{action_emoji.get(action, action)}\n"
-                    f"理由: {reason}{dry_note}{pnl_str}"
+                    f"理由: {reason}{dry_note}{trade_note}{pnl_str}"
                 )
 
                 # ── 旧版简析保留（显示技术摘要给妈妈看）──
