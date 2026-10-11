@@ -127,11 +127,11 @@ def ask_ai_json(prompt: str, model: str = "auto") -> dict:
     APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
     _log = print
 
-    # MODEL_POOL：OpenLux 付费优先（deepseek-v3.2 JSON 稳定性最佳）
+    # MODEL_POOL：OpenLux 付费优先（2026-10-11 更新：v3.2 / r1 已被服务商下线，改用 v4 系列）
     JSON_MODEL_POOL = [
-        "deepseek-v3.2",        # [OpenLux付费] JSON 稳定性最佳（主力）
-        "deepseek-v4-flash",    # [OpenLux付费] 速度最快（备选）
-        "deepseek-r1",          # [OpenLux付费] 推理兜底
+        "deepseek-v4-flash",    # [OpenLux付费] 主力（实测 200）
+        "deepseek-v4.1-flash",  # [OpenLux付费] 备选（更便宜）
+        "deepseek-v3-1",        # [OpenLux付费] 兜底
     ]
 
     if model == "auto":

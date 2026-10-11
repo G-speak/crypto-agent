@@ -346,7 +346,7 @@ def _is_yunwu_ready(timeout: float = 5.0) -> bool:
             "https://api.openlux.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {YUNWU_API_KEY}"},
             json={
-                "model": "deepseek-v3.2",
+                "model": "deepseek-v4-flash",
                 "messages": [{"role": "user", "content": "ping"}],
                 "max_tokens": 5,
                 "temperature": 0,

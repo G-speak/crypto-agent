@@ -152,7 +152,7 @@ def fetch_real_crypto_news(coin_name):
     return ""
 
 # ====== 3. AI 调度 ======
-def ask_agent(role_name, prompt, model="deepseek-v3.2", max_retries=3):
+def ask_agent(role_name, prompt, model="deepseek-v4-flash", max_retries=3):
     headers = {"Authorization": f"Bearer {YUNWU_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": model,
@@ -229,17 +229,17 @@ def run_committee(coin_name, symbol, radar_reason=""):
     # ===== ⏳ 第二层：红蓝激烈对抗中... =====
     send_simple_message(f"⏳ 第二层：红蓝激烈对抗中...\n🐂【多头研究员】🛡️ 构建做多逻辑\n🐻【空头研究员】⚔️ 构建做空逻辑")
     combined = f"技术面：{tech}\n基本面：{fund}\n情绪面：{sent}"
-    bull = ask_agent("bull_researcher", combined, "deepseek-v3.2")
-    bear = ask_agent("bear_researcher", combined, "deepseek-v3.2")
+    bull = ask_agent("bull_researcher", combined, "deepseek-v4-flash")
+    bear = ask_agent("bear_researcher", combined, "deepseek-v4-flash")
     
     # ===== ⏳ 第三层：风控大脑思考中... =====
     send_simple_message(f"⏳ 第三层：风控大脑思考中...\n⚖️【风控经理】🧠 综合多空辩论与持仓状态进行裁决")
     debate = f"多头：{bull}\n空头：{bear}\n当前状态：{mock_position}。账户可用资金约 {avail_usdt:.2f} USDT。请严格遵守铁律。"
-    risk = ask_agent("risk_manager", debate, "deepseek-v3.2")
+    risk = ask_agent("risk_manager", debate, "deepseek-v4-flash")
     
     # ===== ⏳ 第四层：交易员执行... =====
     send_simple_message(f"⏳ 第四层：交易员执行...\n👨‍💻【交易员】⚙️ 将风控裁决转化为交易指令")
-    trade_cmd = parse_json_safely(ask_agent("trader", risk, "deepseek-v3.2"))
+    trade_cmd = parse_json_safely(ask_agent("trader", risk, "deepseek-v4-flash"))
     action = trade_cmd.get("action", "HOLD").upper()
     reason = trade_cmd.get("reason", "无")
     percentage = trade_cmd.get("percentage", 0)

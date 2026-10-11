@@ -328,11 +328,11 @@ MACD: {fmt(s['macd'], suffix="")}
 def ask_ai(prompt, model="auto"):
     """调用AI分析，支持双平台动态路由 + 多模型轮询池 + 每模型3次重试"""
 
-    # MODEL_POOL：付费模型走 OpenLux（不限流，优先），deepseek-v3.2 优先（稳定性最佳）
+    # MODEL_POOL：付费模型走 OpenLux（2026-10-11 更新：v3.2 / r1 已被服务商下线，改用 v4 系列）
     MODEL_POOL = [
-        "deepseek-v3.2",        # [OpenLux付费] 主力，分析稳定性最佳
-        "deepseek-v4-flash",    # [OpenLux付费] 速度最快
-        "deepseek-r1",            # [OpenLux付费] 推理兜底
+        "deepseek-v4-flash",    # [OpenLux付费] 主力（实测 200）
+        "deepseek-v4.1-flash",  # [OpenLux付费] 备选（更便宜）
+        "deepseek-v3-1",        # [OpenLux付费] 兜底
         "gpt-4.1-nano-free",    # [AIHubMix免费] 备用免费模型
         "gpt-4.1-mini-free",    # [AIHubMix免费] 备用免费模型
         "step-3.7-flash-free",  # [AIHubMix免费] 阶跃星辰 Flash
