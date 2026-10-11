@@ -139,7 +139,10 @@ def push_alerts(alerts):
     # ══════════════════════════════════════════════════════════
     if not _is_yunwu_ready():
         log(f"⛔ yunwu.ai 不可达，跳过本轮 {len(alerts)} 条预警推送（AI 不可用）")
+        _notify_ai_down_once(len(alerts))   # 只在"正常→失败"那一次提醒用户
         return
+
+    _ai_health_reset()   # AI 正常 → 复位失败提醒状态（不发消息）
 
     from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     from wechat_push import send_simple_message
@@ -328,6 +331,9 @@ def get_dry_run_status() -> bool:
         return True  # 模块不存在时保守为 True
 
 
+_YUNWU_LAST_ERROR = ""   # 最近一次探测失败的原因（供"首次失败提醒"使用）
+
+
 def _is_yunwu_ready(timeout: float = 5.0) -> bool:
     """
     探测 yunwu.ai 是否可用（AI 主通道）。
@@ -338,7 +344,10 @@ def _is_yunwu_ready(timeout: float = 5.0) -> bool:
 
     注意：v2 的 7 角色委员会和 json 决策都用 Yunwu 付费通道，
     因此只需探测 openlux，不必再探测 AIHubMix 兜底。
+
+    失败原因会记录在模块级 _YUNWU_LAST_ERROR，供"首次失败提醒"使用。
     """
+    global _YUNWU_LAST_ERROR
     import requests as _req
     try:
         from wechat_config import YUNWU_API_KEY
@@ -353,10 +362,80 @@ def _is_yunwu_ready(timeout: float = 5.0) -> bool:
             },
             timeout=timeout,
         )
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            _YUNWU_LAST_ERROR = ""
+            return True
+        # 非 200：把服务商的报错原文带回来（例如 model_not_found / 无可用渠道）
+        try:
+            _err = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            _err = (resp.text or "")[:120]
+        _YUNWU_LAST_ERROR = f"HTTP {resp.status_code} {_err}".strip()
+        return False
     except Exception as e:
+        _YUNWU_LAST_ERROR = f"{type(e).__name__}: {str(e)[:100]}"
         log(f"[openlux探测] 不可用: {str(e)[:80]}")
         return False
+
+
+# ══════════════════════════════════════════════════════════════
+# AI 不可用提醒状态机（用户 2026-10-11 指定）：
+#   正常→失败：提醒 1 次；连续失败：保持安静；恢复成功后自动复位，
+#   之后若再失败，仍只提醒那一次。
+# ══════════════════════════════════════════════════════════════
+AI_HEALTH_FILE = os.path.expanduser("~/.hermes/ai_health_state.json")
+
+
+def _ai_health_load() -> dict:
+    try:
+        with open(AI_HEALTH_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _ai_health_save(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(AI_HEALTH_FILE), exist_ok=True)
+        tmp = AI_HEALTH_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, AI_HEALTH_FILE)
+    except Exception as e:
+        log(f"AI 健康状态写入失败: {e}")
+
+
+def _notify_ai_down_once(n_alerts: int) -> None:
+    """AI 首次不可用时提醒一次；连续失败不再重复（恢复后状态由 _ai_health_reset 复位）。"""
+    st = _ai_health_load()
+    if st.get("ai_failing"):
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st["ai_failing"] = True
+    st["first_fail_at"] = ts
+    _ai_health_save(st)
+    try:
+        from wechat_push import send_simple_message
+        reason = _YUNWU_LAST_ERROR or "未知原因"
+        send_simple_message(
+            f"⚠️ AI 分析通道不可用，本轮 {n_alerts} 条预警未能推送\n"
+            f"🕐 时间: {ts}\n"
+            f"❗ 原因: {reason}\n"
+            f"（连续失败不再重复提醒；AI 恢复后若再失败会再提醒一次）"
+        )
+        log(f"⚠️ 已推送 AI 首次不可用提醒: {reason}")
+    except Exception as e:
+        log(f"AI 不可用提醒推送失败: {e}")
+
+
+def _ai_health_reset() -> None:
+    """AI 恢复可用时复位状态（不发消息），使下一次失败能再提醒一次。"""
+    st = _ai_health_load()
+    if st.get("ai_failing"):
+        st["ai_failing"] = False
+        st["recovered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        _ai_health_save(st)
+        log("✅ AI 已恢复，失败提醒状态已复位")
 
 
 def _fetch_coin_news(coin_name, news_cache, cache_file, today):
