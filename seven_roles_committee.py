@@ -225,7 +225,12 @@ def run_committee(coin_name, symbol, radar_reason=""):
     tech = ask_agent("tech_analyst", market_data, "deepseek-v4-flash")
     fund = ask_agent("fund_analyst", comprehensive_prompt, "deepseek-v4-flash")
     sent = ask_agent("sent_analyst", comprehensive_prompt, "deepseek-v4-flash")
-    
+
+    # 快速失败：第一层 3 个角色全挂 = AI 通道坏了，立刻中止（省掉后面 4 次无效调用）
+    if all("分析失败" in str(_t) for _t in (tech, fund, sent)):
+        print(f"❌ {coin_name} 委员会中止：第一层 3 个角色 AI 调用全部失败")
+        return False   # 交给 alert_monitor 统一"首次失败提醒"
+        
     # ===== ⏳ 第二层：红蓝激烈对抗中... =====
     send_simple_message(f"⏳ 第二层：红蓝激烈对抗中...\n🐂【多头研究员】🛡️ 构建做多逻辑\n🐻【空头研究员】⚔️ 构建做空逻辑")
     combined = f"技术面：{tech}\n基本面：{fund}\n情绪面：{sent}"
@@ -242,6 +247,16 @@ def run_committee(coin_name, symbol, radar_reason=""):
     trade_cmd = parse_json_safely(ask_agent("trader", risk, "deepseek-v4-flash"))
     action = trade_cmd.get("action", "HOLD").upper()
     reason = trade_cmd.get("reason", "无")
+
+    # ── 关键角色 AI 调用失败检查（2026-10-12 用户要求：运行失败要告诉他，且不能推假报告/乱下单）──
+    _fail_markers = ("分析失败", "API异常", "解析指令失败")
+    _crit_failed = any(m in str(risk) for m in _fail_markers) or any(m in str(reason) for m in _fail_markers)
+    if _crit_failed:
+        _failed_n = sum(1 for _t in (tech, fund, sent, bull, bear, risk) if "分析失败" in str(_t))
+        print(f"❌ {coin_name} 委员会中止：风控/交易员 AI 调用失败（{_failed_n}/7 角色失败），不下单、不推报告")
+        return False   # 交给调用方 alert_monitor 统一"首次失败提醒"
+    # ==============================================================
+
     percentage = trade_cmd.get("percentage", 0)
     if not isinstance(percentage, int) or percentage < 0 or percentage > 100:
         percentage = 0
@@ -294,6 +309,7 @@ def run_committee(coin_name, symbol, radar_reason=""):
     
     send_simple_message(wechat_text)
     print(f"✅ {coin_name} 委员会决议已推送。")
+    return True
 
 if __name__ == "__main__":
     # 本地跑单测

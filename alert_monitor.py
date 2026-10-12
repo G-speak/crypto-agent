@@ -207,6 +207,14 @@ def push_alerts(alerts):
                 action = decision.get("action", "HOLD")
                 reason = decision.get("reason", "")
 
+                # ── AI 真失败（≠"分析完给出 HOLD"）→ 提醒一次并跳过这个币 ──
+                # 2026-10-12 用户要求："运行失败就告诉我一下"，不要静默。
+                if ("所有模型调用失败" in reason) or ("解析失败" in reason):
+                    log(f"⚠️ {coin_name} AI 调用失败: {reason}")
+                    _notify_ai_down_once(len(alerts), detail=reason)
+                    continue
+                _ai_health_reset()   # AI 正常 → 复位失败提醒状态（不发消息）
+
                 # ===== 雷达拦截：BUY/SELL 唤醒 7 角色委员会 =====
                 if action in ["BUY", "SELL"]:
                     action_cn = "买入" if action == "BUY" else "卖出"
@@ -222,7 +230,13 @@ def push_alerts(alerts):
 
                     try:
                         import seven_roles_committee
-                        seven_roles_committee.run_committee(coin_name, symbol, reason)
+                        _ok = seven_roles_committee.run_committee(coin_name, symbol, reason)
+                        if _ok is False:
+                            # 委员会中途因 AI 调用失败中止 → 只提醒一次（不推假报告）
+                            log(f"❌ {coin_name} 7角色投研因 AI 调用失败中止")
+                            _notify_ai_down_once(len(alerts), detail="7 角色投研中途失败（AI 调用异常），本次未给出交易结论，也未下单")
+                        else:
+                            _ai_health_reset()
                     except Exception as e:
                         err_msg = f"{chr(0x26a0)}{chr(0xfe0f)} 7角色深度投研唤醒失败: {e}"
                         log(err_msg)
@@ -348,48 +362,55 @@ def get_dry_run_status() -> bool:
 _YUNWU_LAST_ERROR = ""   # 最近一次探测失败的原因（供"首次失败提醒"使用）
 
 
-def _is_yunwu_ready(timeout: float = 5.0) -> bool:
+def _is_yunwu_ready(timeout: float = 20.0) -> bool:
     """
-    探测 yunwu.ai 是否可用（AI 主通道）。
+    探测 openlux 是否可用（AI 主通道）。
 
-    方式：发一个最小 chat 请求，status_code == 200 才算可用。
-    - 超时/断连（被墙）→ False，跳过推送
-    - 返回 401/400/5xx → 网络可达但服务异常，同样视为不可用（避免推失败消息）
+    作用：这是一道"成本/时间保护闸"，只在**真正不可用**时才拦。
+    - 为什么要探测：如果完全不检查，AI 挂掉时每轮都会硬跑 3 模型 × 3 次重试 × 60 秒超时
+      （最坏 9 分钟），把 5 分钟一次的监控循环堵死，还会推出一堆"AI 调用失败"的垃圾消息。
+    - 2026-10-12 调整：超时从 5 秒放宽到 20 秒，并在超时后重试 1 次。
+      原因：实测正常请求延迟在 1.8~5.5 秒之间波动（5 秒门槛会误报，10/12 01:51 就是这么误报的）。
+    - 真正的故障（模型下线 404、密钥失效、网络不可达）都是秒级报错，不受这个超时影响。
 
-    注意：v2 的 7 角色委员会和 json 决策都用 Yunwu 付费通道，
-    因此只需探测 openlux，不必再探测 AIHubMix 兜底。
-
-    失败原因会记录在模块级 _YUNWU_LAST_ERROR，供"首次失败提醒"使用。
+    失败原因记入模块级 _YUNWU_LAST_ERROR，供"首次失败提醒"使用。
     """
     global _YUNWU_LAST_ERROR
     import requests as _req
-    try:
-        from wechat_config import YUNWU_API_KEY
-        resp = _req.post(
-            "https://api.openlux.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {YUNWU_API_KEY}"},
-            json={
-                "model": "deepseek-v4-flash",
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 5,
-                "temperature": 0,
-            },
-            timeout=timeout,
-        )
-        if resp.status_code == 200:
-            _YUNWU_LAST_ERROR = ""
-            return True
-        # 非 200：把服务商的报错原文带回来（例如 model_not_found / 无可用渠道）
+    last_err = ""
+    for attempt in (1, 2):
         try:
-            _err = resp.json().get("error", {}).get("message", "")
-        except Exception:
-            _err = (resp.text or "")[:120]
-        _YUNWU_LAST_ERROR = f"HTTP {resp.status_code} {_err}".strip()
-        return False
-    except Exception as e:
-        _YUNWU_LAST_ERROR = f"{type(e).__name__}: {str(e)[:100]}"
-        log(f"[openlux探测] 不可用: {str(e)[:80]}")
-        return False
+            from wechat_config import YUNWU_API_KEY
+            resp = _req.post(
+                "https://api.openlux.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {YUNWU_API_KEY}"},
+                json={
+                    "model": "deepseek-v4-flash",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5,
+                    "temperature": 0,
+                },
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                _YUNWU_LAST_ERROR = ""
+                return True
+            # 非 200：把服务商的报错原文带回来（例如 model_not_found / 无可用渠道）
+            try:
+                _err = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                _err = (resp.text or "")[:120]
+            last_err = f"HTTP {resp.status_code} {_err}".strip()
+            break               # 明确的 HTTP 错误 → 不重试，直接判定
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:100]}"
+            log(f"[openlux探测] 第{attempt}次失败: {str(e)[:70]}")
+            if attempt == 1:
+                time.sleep(2)   # 抖动：等 2 秒再试一次（避免一次网络抖动就误判）
+                continue
+    _YUNWU_LAST_ERROR = last_err
+    return False
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -419,8 +440,8 @@ def _ai_health_save(d: dict) -> None:
         log(f"AI 健康状态写入失败: {e}")
 
 
-def _notify_ai_down_once(n_alerts: int) -> None:
-    """AI 首次不可用时提醒一次；连续失败不再重复（恢复后状态由 _ai_health_reset 复位）。"""
+def _notify_ai_down_once(n_alerts: int = 0, detail: str = "") -> None:
+    """AI 首次调用失败时提醒一次；连续失败不再重复（恢复后状态由 _ai_health_reset 复位）。"""
     st = _ai_health_load()
     if st.get("ai_failing"):
         return
@@ -430,16 +451,17 @@ def _notify_ai_down_once(n_alerts: int) -> None:
     _ai_health_save(st)
     try:
         from wechat_push import send_simple_message
-        reason = _YUNWU_LAST_ERROR or "未知原因"
+        reason = detail or _YUNWU_LAST_ERROR or "未知原因"
         send_simple_message(
-            f"⚠️ AI 分析通道不可用，本轮 {n_alerts} 条预警未能推送\n"
+            f"⚠️ AI 分析通道调用失败\n"
             f"🕐 时间: {ts}\n"
             f"❗ 原因: {reason}\n"
+            f"📉 影响: 这期间的行情分析和 7 角色投研无法进行（价格监测照常跑，但没有 AI 判断）\n"
             f"（连续失败不再重复提醒；AI 恢复后若再失败会再提醒一次）"
         )
-        log(f"⚠️ 已推送 AI 首次不可用提醒: {reason}")
+        log(f"⚠️ 已推送 AI 首次失败提醒: {reason}")
     except Exception as e:
-        log(f"AI 不可用提醒推送失败: {e}")
+        log(f"AI 失败提醒推送失败: {e}")
 
 
 def _ai_health_reset() -> None:
