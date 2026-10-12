@@ -149,10 +149,8 @@ def push_alerts(alerts):
         _notify_ai_down_once(len(alerts))   # 只在"正常→失败"那一次提醒用户
         return
 
-    _ai_health_reset()   # AI 正常 → 复位失败提醒状态（不发消息）
-
-    from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     from wechat_push import send_simple_message
+    from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     import requests as _req, json as _json
     import hashlib
     from collections import defaultdict
