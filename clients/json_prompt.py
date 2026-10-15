@@ -168,7 +168,7 @@ def ask_ai_json(prompt: str, model: str = "auto") -> dict:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 300,
+            "max_tokens": 500,   # 2026-10-15: 300 太小易被截断导致 JSON 解析失败
         }
 
         for attempt in range(1, 4):

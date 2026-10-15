@@ -152,36 +152,76 @@ def fetch_real_crypto_news(coin_name):
     return ""
 
 # ====== 3. AI 调度 ======
-def ask_agent(role_name, prompt, model="deepseek-v4-flash", max_retries=3):
+# 模型后备链（2026-10-15 加）：v4-flash 偶发 429/超时/空回复时，依次换 v4.1-flash、v3-1。
+# 旧版是"单模型 3 次重试"，一旦失败该角色就变成"[xxx 分析失败]"，整段投研被迫中止。
+AGENT_MODEL_CHAIN = ["deepseek-v4-flash", "deepseek-v4.1-flash", "deepseek-v3-1"]
+
+
+def ask_agent(role_name, prompt, model="deepseek-v4-flash", max_retries=2):
     headers = {"Authorization": f"Bearer {YUNWU_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": AGENT_PROMPTS[role_name]},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3
-    }
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(YUNWU_URL, headers=headers, json=payload, timeout=30)
-            return response.json()['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            time.sleep((attempt + 1) * 2)
+    models = [model] + [m for m in AGENT_MODEL_CHAIN if m != model]
+    last_err = ""
+    for use_model in models:
+        payload = {
+            "model": use_model,
+            "messages": [
+                {"role": "system", "content": AGENT_PROMPTS[role_name]},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 800
+        }
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(YUNWU_URL, headers=headers, json=payload, timeout=30)
+                if response.status_code != 200:
+                    last_err = f"HTTP {response.status_code} {(response.text or '')[:80]}"
+                    break              # 明确的 HTTP 错误（429/404/5xx）→ 直接换下一个模型
+                txt = (response.json()["choices"][0]["message"]["content"] or "").strip()
+                if txt:
+                    return txt
+                last_err = "空回复"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {str(e)[:80]}"
+                time.sleep((attempt + 1) * 2)
+        print(f"⚠️ [7角色] {role_name} 模型 {use_model} 失败: {last_err}")
+    print(f"❌ [7角色] {role_name} 全部模型失败: {last_err}")
     if role_name == "trader": return '{"action": "HOLD", "reason": "API异常，风控强制观望"}'
     return f"[{role_name} 分析失败]"
 
+
 def parse_json_safely(text):
-    text = text.strip()
-    if text.startswith("\x60\x60\x60json"): text = text[7:]
-    elif text.startswith("\x60\x60\x60"): text = text[3:]
-    if text.endswith("\x60\x60\x60"): text = text[:-3]
-    try: return json.loads(text.strip())
-    except:
-        m = re.search(r'\{.*\}', text, re.DOTALL)
+    """尽力从模型输出里解析出 {action, percentage, reason}。
+    2026-10-15：旧版只有 json.loads + 贪婪正则，模型带前后缀/嵌套花括号时直接判"解析指令失败"，
+    整段投研就被中止了（用户看到"前面几层都正常、最后报错"）。这里补上非贪婪匹配 + 字段级兜底。"""
+    if not text or not str(text).strip():
+        return {"action": "HOLD", "reason": "解析指令失败"}
+    t = str(text).strip()
+    if t.startswith("\x60\x60\x60json"): t = t[7:]
+    elif t.startswith("\x60\x60\x60"): t = t[3:]
+    if t.endswith("\x60\x60\x60"): t = t[:-3]
+    t = t.strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    for pat in (r'\{[^{}]*\}', r'\{.*?\}', r'\{.*\}'):
+        m = re.search(pat, t, re.DOTALL)
         if m:
-            try: return json.loads(m.group())
-            except: pass
+            try:
+                return json.loads(m.group())
+            except Exception:
+                continue
+    # 字段级兜底：JSON 坏了也把 action/percentage/reason 抠出来
+    act = re.search(r'"?action"?\s*[:：]\s*"?\s*(BUY|SELL|HOLD)', t, re.IGNORECASE)
+    if act:
+        pct = re.search(r'"?percentage"?\s*[:：]\s*(\d{1,3})', t)
+        rea = re.search(r'"?reason"?\s*[:：]\s*"?([^"\n}]+)', t)
+        return {
+            "action": act.group(1).upper(),
+            "percentage": int(pct.group(1)) if pct else 0,
+            "reason": (rea.group(1).strip() if rea else "未识别原因"),
+        }
     return {"action": "HOLD", "reason": "解析指令失败"}
 
 # ====== 4. 主调用入口 ======
@@ -244,17 +284,25 @@ def run_committee(coin_name, symbol, radar_reason=""):
     
     # ===== ⏳ 第四层：交易员执行... =====
     send_simple_message(f"⏳ 第四层：交易员执行...\n👨‍💻【交易员】⚙️ 将风控裁决转化为交易指令")
-    trade_cmd = parse_json_safely(ask_agent("trader", risk, "deepseek-v4-flash"))
+    trader_raw = ask_agent("trader", risk, "deepseek-v4-flash")
+    trade_cmd = parse_json_safely(trader_raw)
     action = trade_cmd.get("action", "HOLD").upper()
     reason = trade_cmd.get("reason", "无")
 
-    # ── 关键角色 AI 调用失败检查（2026-10-12 用户要求：运行失败要告诉他，且不能推假报告/乱下单）──
-    _fail_markers = ("分析失败", "API异常", "解析指令失败")
-    _crit_failed = any(m in str(risk) for m in _fail_markers) or any(m in str(reason) for m in _fail_markers)
-    if _crit_failed:
+    # ── 失败分类（2026-10-15 修正：区分"AI 真失败"与"只是输出格式没解析出来"）──
+    # A) AI 真的调用失败（角色整段没拿到结果）→ 中止 + 交给调用方"首次失败提醒"，不下单、不推假报告
+    _ai_call_failed = any(m in str(risk) for m in ("分析失败", "API异常"))
+    if _ai_call_failed:
         _failed_n = sum(1 for _t in (tech, fund, sent, bull, bear, risk) if "分析失败" in str(_t))
-        print(f"❌ {coin_name} 委员会中止：风控/交易员 AI 调用失败（{_failed_n}/7 角色失败），不下单、不推报告")
+        print(f"❌ {coin_name} 委员会中止：风控 AI 调用失败（{_failed_n}/7 角色失败），不下单、不推报告")
         return False   # 交给调用方 alert_monitor 统一"首次失败提醒"
+    # B) 只是交易员输出格式没解析出来（模型是通的）→ 不中止：按"观望、不下单"照样出报告
+    if "解析指令失败" in str(reason):
+        print(f"⚠️ {coin_name} 交易员输出无法解析（原文前 200 字）: {trader_raw[:200]}")
+        trade_cmd = {"action": "HOLD", "percentage": 0,
+                     "reason": f"交易员输出格式异常，本次按观望处理、未下单（风控原话: {str(risk)[:100]}）"}
+        action = "HOLD"
+        reason = trade_cmd["reason"]
     # ==============================================================
 
     percentage = trade_cmd.get("percentage", 0)

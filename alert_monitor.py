@@ -205,13 +205,16 @@ def push_alerts(alerts):
                 action = decision.get("action", "HOLD")
                 reason = decision.get("reason", "")
 
-                # ── AI 真失败（≠"分析完给出 HOLD"）→ 提醒一次并跳过这个币 ──
-                # 2026-10-12 用户要求："运行失败就告诉我一下"，不要静默。
-                if ("所有模型调用失败" in reason) or ("解析失败" in reason):
-                    log(f"⚠️ {coin_name} AI 调用失败: {reason}")
+                # ── 失败分类（2026-10-15 修正）──
+                # A) 模型通道全挂（"所有模型调用失败"）→ 这才是"AI 不可用"，提醒一次并跳过
+                # B) 只是输出解析不出来（通道是通的）→ 不算通道故障，只记日志，本次按 HOLD 处理
+                if "所有模型调用失败" in reason:
+                    log(f"⚠️ {coin_name} AI 通道调用失败: {reason}")
                     _notify_ai_down_once(len(alerts), detail=reason)
                     continue
-                _ai_health_reset()   # AI 正常 → 复位失败提醒状态（不发消息）
+                if "解析失败" in reason:
+                    log(f"⚠️ {coin_name} 浅层决策输出无法解析（模型可用，本次按 HOLD 处理）: {reason}")
+                _ai_health_reset()   # AI 通道正常 → 复位失败提醒状态（不发消息）
 
                 # ===== 雷达拦截：BUY/SELL 唤醒 7 角色委员会 =====
                 if action in ["BUY", "SELL"]:
