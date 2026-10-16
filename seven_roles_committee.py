@@ -49,12 +49,20 @@ AGENT_PROMPTS = {
 输出要求：给出情绪定性判断，不超过100字。""",
 
     "bull_researcher": """你是投资委员会的“死多头（Bull）”代表。
-你的任务：阅读技术、基本面、情绪三份报告，拼命寻找**应该买入（BUY）或持有**的理由！你要反驳任何悲观的观点，寻找抄底或追高的机会。
-输出要求：给出强有力的做多逻辑，不超过200字。""",
+你的任务：阅读技术、基本面、情绪三份报告，拼命寻找应该买入（BUY）或持有 的理由！你要反驳任何悲观的观点，寻找抄底或追高的机会。
+【输出格式硬性要求】（违反会被系统截断/丢弃）
+- 直接用中文写论点正文，不要复述对方观点、不要解释你在做什么、不要和读者对话或提问；
+- 严禁“我帮你整理”“你这套框架”这类元话术，也严禁评价任务本身；
+- 不要用 Markdown：不要 ## 标题、不要表格、不要 ** 加粗、不要分隔线；
+- 只写 3-4 条要点，总长不超过 200 字。""",
 
     "bear_researcher": """你是投资委员会的“死空头（Bear）”代表。
-你的任务：阅读技术、基本面、情绪三份报告，拼命寻找**应该卖出（SELL）或观望**的理由！无情打击多头的盲目乐观。
-输出要求：给出强有力的做空/避险逻辑，不超过200字。""",
+你的任务：阅读技术、基本面、情绪三份报告，拼命寻找应该卖出（SELL）或观望 的理由！无情打击多头的盲目乐观。
+【输出格式硬性要求】（违反会被系统截断/丢弃）
+- 直接用中文写论点正文，不要复述对方观点、不要解释你在做什么、不要和读者对话或提问；
+- 严禁“我帮你整理”“你这套框架”这类元话术，也严禁评价任务本身；
+- 不要用 Markdown：不要 ## 标题、不要表格、不要 ** 加粗、不要分隔线；
+- 只写 3-4 条要点，总长不超过 200 字。""",
 
     "risk_manager": """你是公司的终极风控大脑与投资委员会主席。
 你的任务：
@@ -224,6 +232,33 @@ def parse_json_safely(text):
         }
     return {"action": "HOLD", "reason": "解析指令失败"}
 
+# ── 企业微信推送长度/markdown 保护（2026-10-15 加）──────────────
+# 企业微信 text 消息上限 2048 字节（中文 3 字节/字），超长会被静默截断；
+# 而且企业微信不渲染 Markdown（**加粗**、## 标题、表格会原样显示）。
+WECHAT_MAX_BYTES = 1900
+
+
+def _strip_md(t) -> str:
+    """去掉企业微信不渲染的 Markdown 记号。"""
+    if not t:
+        return ""
+    s = str(t)
+    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)                     # **加粗**
+    s = re.sub(r'^\s{0,3}#{1,6}\s*', '', s, flags=re.M)        # ## 标题
+    s = re.sub(r'^\s*\|?[\s:|-]+\|[\s:|-]*$', '', s, flags=re.M)  # |---|---| 表格分隔行
+    s = s.replace('|', ' ')                                    # 表格竖线
+    s = re.sub(r'^\s*[-*_]{3,}\s*$', '', s, flags=re.M)        # --- 分隔线
+    s = re.sub(r'^\s*>\s?', '', s, flags=re.M)                 # > 引用
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
+
+def _clip(t, n: int) -> str:
+    """去 markdown + 限长（超长加省略号）。"""
+    t = _strip_md(t)
+    return t if len(t) <= n else t[:n].rstrip() + "…"
+
+
 # ====== 4. 主调用入口 ======
 def run_committee(coin_name, symbol, radar_reason=""):
     """由 alert_monitor 触发的深度投研"""
@@ -342,21 +377,32 @@ def run_committee(coin_name, symbol, radar_reason=""):
             pnl_msg = (f"{act_emoji} 深度判定卖出，已成交！\n"
                        f"   动用仓位 {percentage}% ｜ 成交价 ${fill_price:,.2f} ｜ 数量 {qty}{dr_note}{tail}")
     
-    # ===== 组装最终微信报告（完整输出，不截断） =====
+    # ===== 组装最终微信报告 =====
+    # 2026-10-15：企业微信单条文本上限 2048 字节（中文 3 字节/字），超了会被微信静默截断
+    # （用户实测：多头写了一大段 Markdown，结果报告尾部"风控拍板/账户动态"整段丢失）。
+    # 现在做两层保护：① 去掉微信不渲染的 Markdown；② 限长 + 自动收紧，保证整条 ≤1900 字节。
     emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(action, "⚪")
-    wechat_text = (
-        f"🤖 7角色深度投研报告 [{coin_name}]\n"
-        f"----------------------\n"
-        f"🐂 多头核心逻辑:\n{bull}\n\n"
-        f"🐻 空头核心逻辑:\n{bear}\n"
-        f"----------------------\n"
-        f"⚖️ 风控最终拍板:\n{emoji} 决策: {action}\n"
-        f"💡 理由: {reason}\n\n"
-        f"💼 账户动态:\n{pnl_msg}"
-    )
-    
+
+    def _build(bull_n, reason_n):
+        return (
+            f"🤖 7角色深度投研报告 [{coin_name}]\n"
+            f"----------------------\n"
+            f"🐂 多头核心逻辑:\n{_clip(bull, bull_n)}\n\n"
+            f"🐻 空头核心逻辑:\n{_clip(bear, bull_n)}\n"
+            f"----------------------\n"
+            f"⚖️ 风控最终拍板:\n{emoji} 决策: {action}\n"
+            f"💡 理由: {_clip(reason, reason_n)}\n\n"
+            f"💼 账户动态:\n{pnl_msg}"
+        )
+
+    wechat_text = _build(200, 150)
+    for _bn, _rn in ((120, 120), (80, 80), (40, 60)):
+        if len(wechat_text.encode("utf-8")) <= WECHAT_MAX_BYTES:
+            break
+        wechat_text = _build(_bn, _rn)
+
     send_simple_message(wechat_text)
-    print(f"✅ {coin_name} 委员会决议已推送。")
+    print(f"✅ {coin_name} 委员会决议已推送（{len(wechat_text.encode('utf-8'))} 字节）。")
     return True
 
 if __name__ == "__main__":
