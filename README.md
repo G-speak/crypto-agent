@@ -1,68 +1,61 @@
-# AI 币助手 🤖💰
+# Crypto Agent — 安全维护版
 
-加密货币监控 + AI 分析机器人，通过企业微信推送实时行情分析和价格异动预警。
+加密货币行情与 AI 研究系统。本维护版默认纸面交易，真实订单发送路径已移除；不能通过环境变量或 `DRY_RUN=False` 开启实盘。不保证收益。
 
-## 功能
+## 当前边界
 
-- **定时推送** — 每天 08:00 / 20:00 推送 BTC、ETH、SOL、BNB 的技术面分析（含走势图）
-- **实时异动监控** — 每 5 分钟检查价格波动、RSI 超卖超买、布林带突破
-- **AI 智能分析** — 自动路由：日常分析走 DeepSeek，实时新闻走 Grok，带搜索功能
-- **自动补仓/卖出价位提醒** — 用户可设置价格预警
+- 订单核实工具仅能向固定 Gate 主机发送白名单 GET 请求，不提供下单/撤单接口。
+- 纸面账户以 SQLite 事务保存现金、FIFO 成本、净盈亏和幂等结果；记录模拟手续费及滑点。
+- 纸面止损、回撤和日亏损保护独立于 AI 与普通信号冷却。止损工作线程默认每 10 秒检查一次，网络延迟会延长实际周期；不是交易所托管保护单。
+- `--once` 只做离线源码检查，不读取真实配置、账户、密钥或行情，不写冷却/账本，不发微信。
+- 微信通知默认关闭；回调默认空用户白名单。配置缺失或无效时不放行。
+- 本分支是隔离验证与维护交付，不会自动部署到服务器，也不包含生产配置和密钥。
 
-## 快速开始
+## 最安全的开始方式
 
-### 1. 配置环境变量
+离线检查不需要提供任何真实配置：
 
-```bash
-cp .env.example .env
-# 编辑 .env 填入你的 Key
-vim .env
+```sh
+python3 alert_monitor.py --once
 ```
 
-需要申请：
-1. **企业微信应用** — 在 [work.weixin.qq.com](https://work.weixin.qq.com) 后台创建应用，获取 CORPID、SECRET、TOKEN、ENCODING_AES_KEY
-2. **AIHubMix Key** — 在 [aihubmix.com](https://aihubmix.com) 注册，充值后获取 API Key
-3. **DeepSeek Key** — 在 [platform.deepseek.com](https://platform.deepseek.com) 注册获取
+完整回归在临时副本内运行，自动使用假配置、临时 HOME 和网络阻断，不读取项目中的真实客户端配置：
 
-### 2. 安装依赖
-
-```bash
-pip install requests matplotlib numpy cryptography flask
+```sh
+python3 -m pip install -r requirements.txt
+python3 tools/run_tests.py --json-output artifacts/offline-tests.json
 ```
 
-### 3. 启动服务
+项目目前包含 27 项回归检查、85 项修复检查、8 项日志测试、18 项入口/诊断测试、12 项回调测试及 32 项成交/风险测试。GitHub Actions 会执行同一测试入口。计数不代表独立安全属性数量。
 
-```bash
-# 加载环境变量
-export $(grep -v '^#' .env | xargs)
+## 配置
 
-# 启动定时推送 + 预警监控
-python3 server_monitor.py
+运行原有监控入口时，需要在本地将 `clients/example.json` 复制为 `clients/mom.json` 后填写；真实配置被 `.gitignore` 排除，不要提交。`CRYPTO_CLIENT` 默认为 `mom`。不要用测试假配置覆盖已有配置。
 
-# 启动企业微信回调（用户发消息自动回复）
-python3 wechat_server.py
+`notifications_enabled` 默认 false；本交付未开通真实通知。`callback_allowed_users` 默认空数组，只接受明确允许的用户。回调仅支持自建企业应用的文本消息；不支持第三方套件 ReceiveId 语义或其他事件。
+
+## 真实环境只读检查
+
+```sh
+python3 tools/verify_runtime.py
+# 如需读取已有真实账户，凭据必须留在服务器上，文件属主正确、权限为 600：
+python3 tools/verify_runtime.py --env-file /path/to/gateio.env
 ```
 
-## 优惠活动
+只读检查读取公开行情，可选读取账户与已有历史订单，并在临时账户执行模拟往返。它没有真实下单、撤单、微信或 AI 请求。没有近期历史订单时会明确输出 `no_recent_spot_order_available`，不把模拟成交冒充真实成交核实。
 
-本项目已集成 **AIHubMix** 作为模型供应商。如果你也想享受 10% 计费优惠：
+## 交易与风险实现
 
-1. 登录 [aihubmix.com/appstore](https://aihubmix.com/appstore) 申请应用 Code
-2. 在环境变量中设置 `AIHUBMIX_APP_CODE=你的6位Code`
-3. 调用 AIHubMix API 时自动带上 `APP-Code` 请求头
+- `clients/gate_readonly.py`：固定主机、签名 GET、禁止重定向、完整成交分页。
+- `clients/order_journal.py`：幂等意图、已有订单绑定、稳定订单快照、逐笔成交去重、部分成交/撤销/未知状态，手续费保留原币种。
+- `clients/paper_account.py`：事务式纸面账本，禁止损坏账本静默重置；新账本单边模拟费率 0.1%、滑点 0.1%，最小模拟成交额 5 USDT。
+- 纸面保护默认单币止损 5%、账户高水位回撤 10%、日亏损 3%，行情观测有效期 60 秒。以上均为模拟假设，并非已批准的实盘参数。熔断状态持久保存，不自动恢复。行情缺失禁止新增风险；仍允许依据其他新鲜行情执行保护性退出。
+- 所有纸面写入均从同一 SQLite 事务更新，普通交易与风险退出不会超卖或重复入账。执行入口支持 `request_id`，委员会使用扫描 ID 派生幂等请求。
 
-适用模型：所有模型（除 Claude 系列），请求计费 10% 优惠。
+## 已验证与尚未验证
 
-## 项目结构
+2026-10-22：Mac 与 Linux 系统断网隔离测试通过。真实 Gate 公开行情和账户只读访问通过；没有可用近期现货历史订单，未在真实成交上验证核实流程。真实下单/撤单/微信未执行，生产服务未部署或重启。
 
-```
-├── wechat_config.py      # 配置（从环境变量读取）
-├── wechat_push.py         # 企业微信消息推送
-├── wechat_server.py       # 企业微信回调服务 (Flask)
-├── crypto_monitor.py      # 行情数据获取 + AI 分析
-├── alert_monitor.py       # 实时异动监控
-├── price_alerts.py        # 用户自定义价格预警
-├── server_monitor.py      # 服务启动入口
-├── run_monitor.py         # 定时推送循环
-└── .env.example           # 环境变量模板
-```
+后续开放实盘仍需要独立低权限执行器与密钥隔离、真实仓位/待成交订单统一对账、订单发送崩溃恢复、可批准风险参数及单独授权。当前只读订单模块不能发送交易，也没有将它包装成可实盘的执行器。
+
+已有日志模块仍存在短裸凭据识别、轮转并发和祖先目录信任边界；回调去重是先登记再派发，崩溃可能丢失回复，尚非可恢复队列。详见 `docs/safety-validation.md`。不要把本分支的测试通过理解为生产安全认证。

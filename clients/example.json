@@ -1,0 +1,20 @@
+{
+  "name": "example",
+  "wechat": {
+    "corp_id": "REPLACE_LOCALLY",
+    "agent_id": "1000001",
+    "secret": "REPLACE_LOCALLY",
+    "token": "REPLACE_LOCALLY",
+    "aes_key": "REPLACE_LOCALLY"
+  },
+  "api": {
+    "ai_api_key": "REPLACE_LOCALLY",
+    "yunwu_api_key": "REPLACE_LOCALLY"
+  },
+  "watchlist": {"BTC": "btcusdt", "ETH": "ethusdt"},
+  "major_coins": ["BTC", "ETH", "SOL", "BNB"],
+  "alert_cooldown": 7200,
+  "monitor_interval": 300,
+  "callback_allowed_users": [],
+  "notifications_enabled": false
+}
