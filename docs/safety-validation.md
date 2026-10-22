@@ -41,3 +41,7 @@ Run `python tools/run_tests.py --json-output artifacts/offline-tests.json`. The 
 For read-only connectivity on a trusted machine, use `python tools/verify_runtime.py` and optionally `--env-file /path/to/600-permission/gateio.env`. This reads existing state and uses only a temporary paper/journal database. A successful result means read connectivity and the stated paper path worked; it is not proof of live trading or profitability.
 
 Deployment preflight found an additional hardcoded SMTP authorization secret in the imported health_checker.py, missed by the earlier secret-name scan. It has been removed, SMTP configuration now comes only from environment variables, and sending is disabled unless explicitly enabled. The previous maintenance commits had already exposed this value, so it also requires provider-side revocation if not included in the user's completed rotation. No secret values are included in this note.
+
+## Subsequent authorized paper rollout
+
+A later explicitly authorized rollout updated the monitor in paper mode. The maintained suite now has 183 checks/cases. It did not enable real order transmission or notifications. Operational details and recovery records are retained privately. See production-rollout-20261022.md for the public release boundary.
