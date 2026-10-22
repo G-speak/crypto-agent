@@ -308,6 +308,12 @@ class AdapterAndWorkerTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertNotIn('FAKE_CREDENTIAL_DO_NOT_LOG_123456',output.getvalue())
 
+    def test_health_email_disabled_without_explicit_authorization(self):
+        import health_checker
+        with patch.object(health_checker.smtplib,'SMTP') as smtp:
+            self.assertFalse(health_checker.send_email('fixture','fixture'))
+            smtp.assert_not_called()
+
     def test_notifications_disabled_before_token_or_send_http(self):
         import wechat_push
         with patch.object(wechat_push.requests,'get') as get,patch.object(wechat_push.requests,'post') as post:

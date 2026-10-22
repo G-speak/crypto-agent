@@ -26,7 +26,7 @@ python3 -m pip install -r requirements.txt
 python3 tools/run_tests.py --json-output artifacts/offline-tests.json
 ```
 
-项目目前包含 27 项回归检查、85 项修复检查、8 项日志测试、18 项入口/诊断测试、12 项回调测试及 32 项成交/风险测试。GitHub Actions 会执行同一测试入口。计数不代表独立安全属性数量。
+项目目前包含 27 项回归检查、85 项修复检查、8 项日志测试、18 项入口/诊断测试、12 项回调测试及 33 项成交/风险测试。GitHub Actions 会执行同一测试入口。计数不代表独立安全属性数量。
 
 ## 配置
 

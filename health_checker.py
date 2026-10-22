@@ -12,11 +12,12 @@ from email.mime.text import MIMEText
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ====== 配置 ======
-ALARM_EMAIL = "1127923801@qq.com"
-SMTP_HOST = "smtp.qq.com"
+ALARM_EMAIL = os.environ.get("CRYPTO_ALARM_EMAIL", "")
+SMTP_HOST = os.environ.get("CRYPTO_SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = 587
-SMTP_USER = "1127923801@qq.com"
-SMTP_PASS = "hwfzvakwjhwkgcej"
+SMTP_USER = os.environ.get("CRYPTO_SMTP_USER", "")
+SMTP_PASS = os.environ.get("CRYPTO_SMTP_PASS", "")
+EMAIL_ENABLED = os.environ.get("CRYPTO_EMAIL_ENABLED") == "1"
 
 COOLDOWN_FILE = os.path.expanduser("~/.hermes/alert_cooldown.json")
 LOG_FILE = os.path.expanduser("~/.hermes/logs/alert_monitor.log")
@@ -46,6 +47,8 @@ def save_json(path, data):
 
 def send_email(subject, body):
     """发送告警邮件"""
+    if EMAIL_ENABLED is not True or not all((SMTP_USER, SMTP_PASS, ALARM_EMAIL)):
+        return False
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = SMTP_USER
