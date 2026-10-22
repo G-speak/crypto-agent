@@ -102,7 +102,7 @@ def gate_get_ticker(symbol):
         # 获取K线数据（用于RSI、布林带计算）
         resp2 = requests.get(
             f"{GATE_BASE}/spot/candlesticks",
-            params={"currency_pair": gate_pair, "interval": "1h", "limit": 100},
+            params={"currency_pair": gate_pair, "interval": "1h", "limit": 250},  # 2026-10-17: 100→250（SMA200 需 200 根）
             timeout=10
         )
         resp2.raise_for_status()
@@ -155,14 +155,21 @@ def get_klines(symbol, period="60min", size=100):
 # ==================== 技术指标 ====================
 
 def calc_rsi(closes, period=14):
+    """标准 Wilder 平滑 RSI（RMA）——2026-10-17 由"简化平均法"改，
+    使计算结果与交易所/看盘软件显示一致。"""
     if len(closes) < period + 1:
         return 50.0
-    deltas = np.diff(closes[-(period+1):])
-    gains = deltas[deltas > 0].sum() if len(deltas[deltas > 0]) > 0 else 0
-    losses = -deltas[deltas < 0].sum() if len(deltas[deltas < 0]) > 0 else 0
-    if losses == 0:
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = gains[:period].mean()
+    avg_loss = losses[:period].mean()
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
+    if avg_loss == 0:
         return 100.0
-    return round(100 - (100 / (1 + gains / losses)), 1)
+    return round(100 - (100 / (1 + avg_gain / avg_loss)), 1)
 
 
 def calc_ema(closes, period):
@@ -198,8 +205,12 @@ def calc_macd(closes):
     ema26 = calc_ema(closes, 26)
     if ema12 is None or ema26 is None:
         return None, None, None
-    macd = round(ema12 - ema26, 2)
-    signal = round(np.mean([macd]), 2)
+    # 2026-10-17 修复：原实现 signal = mean([macd]) 恒等于 macd → 柱状图永远是 0、
+    # 金叉/死叉永远判不出来。改为标准的"MACD 线的 9 期 EMA 作为信号线"。
+    macd_series = [a - b for a, b in zip(calc_ema_series(closes, 12), calc_ema_series(closes, 26))]
+    signal_series = calc_ema_series(macd_series, 9)
+    macd = round(macd_series[-1], 2)
+    signal = round(signal_series[-1], 2) if signal_series else macd
     hist = round(macd - signal, 2)
     return macd, signal, hist
 
