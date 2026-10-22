@@ -54,7 +54,7 @@ def huobi_get(path, params=None):
     """请求火币 API (带重试)"""
     url = f"{HUOBI_BASE}{path}"
     last_error = None
-    
+
     for attempt in range(2):
         try:
             resp = requests.get(url, params=params, timeout=10)
@@ -71,7 +71,7 @@ def huobi_get(path, params=None):
             last_error = str(e)
             if attempt < 2:
                 time.sleep(1)
-    
+
     # 火币失败，使用 CryptoCompare
     log(f"火币失败，切换到 CryptoCompare")
     return None
@@ -98,7 +98,7 @@ def gate_get_ticker(symbol):
         low_24h = float(ticker_data["low_24h"])
         vol = float(ticker_data["base_volume"])
         vol_usdt = float(ticker_data["quote_volume"])
-        
+
         # 获取K线数据（用于RSI、布林带计算）
         resp2 = requests.get(
             f"{GATE_BASE}/spot/candlesticks",
@@ -107,7 +107,7 @@ def gate_get_ticker(symbol):
         )
         resp2.raise_for_status()
         candles = resp2.json()
-        
+
         klines = []
         for c in candles:
             klines.append({
@@ -118,7 +118,7 @@ def gate_get_ticker(symbol):
                 "volumefrom": float(c[6]),
                 "volumeto": float(c[1]) * float(c[6]),  # approximate
             })
-        
+
         ticker = {
             "close": price,
             "open": float(ticker_data.get("open", 0) or price),
@@ -127,9 +127,9 @@ def gate_get_ticker(symbol):
             "amount": vol,
             "vol": vol_usdt,
         }
-        
+
         return ticker, klines, change_pct
-        
+
     except Exception as e:
         raise Exception(f"Gate.io 获取失败: {e}")
 
@@ -447,7 +447,7 @@ def main():
         # 显示图路径
         if chart_path:
             charts.append(chart_path)
-        
+
         print(f"  📊 RSI: {data['rsi']} ({data['rsi_signal']})  |  成交量比: {data['vol_ratio']}x")
         print()
 

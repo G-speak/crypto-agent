@@ -499,13 +499,13 @@ def _run_committee(coin_name, symbol, radar_reason="", scan_id=None):
         print(f"⚠️ [7角色] 调用 analyze_symbol 失败，退回轻量抓取: {_e}")
 
     market_data, current_price = fetch_real_crypto_data(gate_symbol, rich=rich)
-    if not market_data: 
+    if not market_data:
         send_simple_message(f"❌ {coin_name} 数据抓取失败，委员会解散")
         print("❌ 数据抓取失败，委员会解散")
         return
-        
+
     news_data = fetch_real_crypto_news(coin_name)
-    
+
     # 从 Hermes 原生账本获取真实持仓
     holdings = _get_holdings()
     coin_base = coin_name.upper()
@@ -538,13 +538,13 @@ def _run_committee(coin_name, symbol, radar_reason="", scan_id=None):
     combined = f"技术面：{tech}\n基本面：{fund}\n情绪面：{sent}"
     bull = require_role("bull_researcher", ask_agent("bull_researcher", raw_block + combined, ROLE_MODELS["bull_researcher"], coin_name=coin_name))
     bear = require_role("bear_researcher", ask_agent("bear_researcher", raw_block + combined, ROLE_MODELS["bear_researcher"], coin_name=coin_name))
-    
+
     # ===== ⏳ 第三层：风控大脑思考中... =====
     send_simple_message(f"⏳ 第三层：风控大脑思考中...\n⚖️【风控经理】🧠 综合多空辩论与持仓状态进行裁决")
     debate = (f"{raw_block}多头：{bull}\n空头：{bear}\n当前状态：{mock_position}。"
               f"账户可用资金约 {avail_usdt:.2f} USDT。请严格遵守铁律。")
     risk = require_role("risk_manager", ask_agent("risk_manager", debate, ROLE_MODELS["risk_manager"], coin_name=coin_name))
-    
+
     # ===== ⏳ 第四层：交易员执行... =====
     send_simple_message(f"⏳ 第四层：交易员执行...\n👨‍💻【交易员】⚙️ 将风控裁决转化为交易指令")
     trader_raw = require_role("trader", ask_agent("trader", risk, ROLE_MODELS["trader"], coin_name=coin_name))
@@ -563,7 +563,7 @@ def _run_committee(coin_name, symbol, radar_reason="", scan_id=None):
     # ===== 执行决策并记录账本 =====
     trade_result = {"action": "HOLD", "pnl_pct": 0, "pnl_usdt": 0}
     pnl_msg = f"⚪ 投研判定风险过高，维持观望。\n(初筛理由: {radar_reason})"
-    
+
     if action in ["BUY", "SELL"]:
         # P0-D（2026-10-22 第三轮）：下单异常必须被记录成"失败/结果未知"。
         # 注意：exchange_confirmed 恒为 False —— 现在拿到的只是"下单函数返回值"，
@@ -610,7 +610,7 @@ def _run_committee(coin_name, symbol, radar_reason="", scan_id=None):
             tail = f"\n💸 模拟平仓收益: {sign}{pnl_pct:.2f}%" if (DRY_RUN and pnl_pct != 0) else ""
             pnl_msg = (f"{act_emoji} 深度判定卖出，模拟成交！\n"
                        f"   动用仓位 {percentage}% ｜ 成交价 ${fill_price:,.2f} ｜ 数量 {qty}{dr_note}{tail}")
-    
+
     # ===== 组装最终微信报告 =====
     # 2026-10-15：企业微信单条文本上限 2048 字节（中文 3 字节/字），超了会被微信静默截断
     # （用户实测：多头写了一大段 Markdown，结果报告尾部"风控拍板/账户动态"整段丢失）。

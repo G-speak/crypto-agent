@@ -618,7 +618,7 @@ def _fetch_coin_news(coin_name, news_cache, cache_file, today):
             "https://cointelegraph.com/rss",
         ]
         rss_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        
+
         for url in urls:
             try:
                 r = _req.get(url, headers=rss_headers, timeout=10)
@@ -684,7 +684,7 @@ def _fetch_coin_news(coin_name, news_cache, cache_file, today):
             with open(cache_file, "w") as f:
                 json.dump(news_cache, f)
             return fallback
-            
+
     except Exception as e:
         log(f"获取新闻异常({coin_name}): {e}")
 

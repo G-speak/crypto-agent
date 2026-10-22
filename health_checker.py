@@ -144,22 +144,22 @@ def check_processes():
 def health_check():
     """执行一次全面健康检查，返回(ok, details)"""
     issues = []
-    
+
     # 1. 检查API余额
     if not check_api_balance():
         issues.append("DeepSeek余额检查异常")
-    
+
     # 2. 检查进程
     if not check_processes():
         issues.append("有进程未运行")
-    
+
     # 3. 记录健康状态
     state = load_json(HEALTH_FILE)
     state["last_check"] = time.time()
     state["ok"] = len(issues) == 0
     state["issues"] = issues
     save_json(HEALTH_FILE, state)
-    
+
     return len(issues) == 0, issues
 
 if __name__ == "__main__":

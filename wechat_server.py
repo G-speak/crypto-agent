@@ -167,7 +167,7 @@ def handle_message(content, from_user):
             current_watchlist = [(k, v) for k, v in wl.items()]
         else:
             current_watchlist = [("BTC","btcusdt"),("ETH","ethusdt"),("SOL","solusdt"),("BNB","bnbusdt")]
-        
+
         # Step 1: Keyword-based coin detection (fast, no AI call)
         matched_coin = None
         content_upper = content.upper()
@@ -175,7 +175,7 @@ def handle_message(content, from_user):
             if c_name in content_upper or c_sym.replace("usdt","").upper() in content_upper:
                 matched_coin = c_name
                 break
-        
+
         # Step 2: Fetch data only for the relevant coin(s)
         if matched_coin:
             from crypto_monitor import analyze_symbol as _analyze
@@ -322,27 +322,27 @@ def handle_add_coin(coin, user_id):
     """添加币种到监控"""
     coin = coin.upper().strip()
     watchlist = _read_watchlist()
-    
+
     if coin in watchlist:
         return f"⚠️ {coin} 已经在监控列表里了"
-    
+
     symbol = f"{coin.lower()}usdt"
     watchlist[coin] = symbol
     _save_watchlist(watchlist)
-    
+
     return f"✅ 已加入 {coin} 监控！\n当前监控: {', '.join(watchlist.keys())}"
 
 def handle_remove_coin(coin, user_id):
     """从监控移除币种"""
     coin = coin.upper().strip()
     watchlist = _read_watchlist()
-    
+
     if coin not in watchlist:
         return f"⚠️ {coin} 不在监控列表中"
-    
+
     del watchlist[coin]
     _save_watchlist(watchlist)
-    
+
     return f"✅ 已移除 {coin} 监控\n当前监控: {', '.join(watchlist.keys()) if watchlist else '无'}"
 
 
