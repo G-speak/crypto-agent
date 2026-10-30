@@ -669,7 +669,8 @@ check("E3 直接调用真实实现返回 False（requests.post 已注入为必�
       _direct is False, "ret=%r" % (_direct,))
 msgs = [str(x[0]) if x else "" for x in SENT]
 check("E4 委员会文案可枚举地落在桩上（成功/失败两种都出现过）",
-      any("模拟成交！" in m for m in msgs) and any("未能模拟成交" in m for m in msgs),
+      any("成交！" in m and "DRY RUN 模拟" in m for m in msgs)
+      and any("但未能成交" in m and "DRY RUN 模拟" in m for m in msgs),
       "msgs=%d" % len(msgs))
 
 # ══════════════════ K1-K6 字典键 / 事件名 脱敏绕过 ══════════════════

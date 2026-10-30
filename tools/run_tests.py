@@ -11,7 +11,7 @@ import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
 SUITES=('p0_tests.py','p0_fixes_tests.py','audit_e2e.py','safety_p1_tests.py',
-        'callback_p1_tests.py','reconciliation_risk_tests.py')
+        'callback_p1_tests.py','reconciliation_risk_tests.py','position_review_tests.py','committee_coordination_tests.py','radar_shadow_tests.py')
 GUARD='''import socket\ndef blocked(*a, **k):\n    raise OSError("offline tests: network disabled")\nsocket.socket.connect=blocked\nsocket.socket.connect_ex=blocked\nsocket.create_connection=blocked\nsocket.getaddrinfo=blocked\n'''
 
 
@@ -32,7 +32,7 @@ def main():
         dependencies=[p for p in sys.path if p and Path(p).is_dir() and Path(p).resolve()!=ROOT]
         env={'PATH':os.environ.get('PATH','/usr/bin:/bin'),'HOME':str(home),
              'PYTHONPATH':os.pathsep.join([str(guard),*dependencies]),
-             'PYTHONDONTWRITEBYTECODE':'1','CRYPTO_CLIENT':'mom'}
+             'PYTHONDONTWRITEBYTECODE':'1','CRYPTO_CLIENT':'mom','GATEIO_DRY_RUN':'1'}
         for name in SUITES:
             try:
                 p=subprocess.run([sys.executable,'-B',str(work/'tests'/name)],cwd=work,env=env,

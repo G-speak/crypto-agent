@@ -57,16 +57,25 @@ class ExecutorTests(unittest.TestCase):
     def test_paper_default(self):
         self.assertIs(gt.DRY_RUN, True)
 
-    def test_live_denied_before_any_account_or_credential_access(self):
-        with patch.object(gt, 'DRY_RUN', False), patch.object(gt, '_paper_holdings') as holdings, \
-                patch.object(gt, '_load_env') as secrets, patch.object(gt, '_get_exchange') as exchange, \
+    def test_live_balance_failure_blocks_executor_and_credentials(self):
+        with patch.object(gt, 'DRY_RUN', False), patch.object(gt, 'get_real_holdings', side_effect=RuntimeError('fixture')) as holdings, \
+                patch.object(gt, '_load_env') as secrets, patch.object(gt, '_live_trade') as live, \
                 patch.object(gt, '_paper_trade') as paper:
             for invocation in ('', 'forged-systemd-id'):
                 with patch.dict(os.environ, {'INVOCATION_ID': invocation, 'GATEIO_API_KEY': 'FAKE'}):
                     result = gt.execute_order('BTC/USDT', 'BUY', percentage=20)
                     self.assertFalse(result['success'])
-                    self.assertEqual(result['status'], 'blocked_live')
-            for mock in (holdings, secrets, exchange, paper): mock.assert_not_called()
+                    self.assertEqual(result['status'], 'holdings_unavailable')
+            self.assertEqual(holdings.call_count,2)
+            for mock in (secrets, live, paper): mock.assert_not_called()
+
+    def test_explicit_live_request_dispatches_once_to_mock_executor(self):
+        with patch.object(gt,'DRY_RUN',False), patch.object(gt,'get_real_holdings',return_value={'SOL':{'quantity':1}}), \
+                patch.object(gt,'_live_trade',return_value={'success':True,'status':'submitted'}) as live, \
+                patch.object(gt,'_paper_trade') as paper:
+            result=gt.execute_order('SOL/USDT','SELL',percentage=100)
+        self.assertEqual(result['status'],'submitted')
+        live.assert_called_once();paper.assert_not_called()
 
     def test_invalid_direct_calls_never_reach_account_or_paper(self):
         cases = [dict(action='WHAT', percentage=20), dict(action='buy', percentage=20),
@@ -170,16 +179,16 @@ class CommitteeTests(unittest.TestCase):
             self.assertTrue(committee.run_committee('BTC', 'btcusdt'))
         self.execute.assert_called_once_with('btcusdt', 'BUY', amount_usdt=10, coin_name='BTC', percentage=20, request_id=None)
 
-    def test_bad_capital_and_live_mode_stop_early(self):
+    def test_bad_capital_and_unavailable_live_balance_stop_before_ai(self):
         for capital in (0, -1, float('nan'), float('inf')):
             with self.subTest(capital=capital), patch.object(committee, '_get_initial_capital_usdt', return_value=capital), \
                     patch.object(committee, 'ask_agent') as ask:
                 self.assertFalse(committee.run_committee('BTC', 'btcusdt'))
                 ask.assert_not_called(); self.execute.assert_not_called()
-        with patch.object(gt, 'DRY_RUN', False):
-            self.notify.reset_mock()
+        with patch.object(gt, 'DRY_RUN', False), patch.object(gt, 'get_real_balance',return_value=None) as balance, \
+                patch.object(committee,'ask_agent') as ask:
             self.assertFalse(committee.run_committee('BTC', 'btcusdt'))
-            self.notify.assert_not_called(); self.execute.assert_not_called()
+            balance.assert_called_once();ask.assert_not_called();self.execute.assert_not_called()
 
     def test_transport_error_is_typed_failure_even_if_text_has_no_failure_marker(self):
         with patch.object(committee.requests, 'post', side_effect=OSError('fixture-error')), \

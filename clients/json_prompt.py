@@ -35,11 +35,8 @@ def build_json_prompt(data: dict, coin_name: str, news_text: str = "",
     # 如果没传入持仓信息，尝试自动获取
     if not holdings_text:
         try:
-            from clients.gateio_trade import _get_holdings
-            h = _get_holdings()
-            coin_base = coin_name.upper().split("/")[0]
-            qty = h.get(coin_base, {}).get("quantity", 0.0)
-            holdings_text = f"{coin_name}: {'有持仓' if qty > 0 else '空仓（无持仓）'}"
+            from clients.position_review import position_context, position_text
+            holdings_text = position_text(coin_name, position_context(coin_name.upper(), data.get('price', 0)))
         except ImportError:
             holdings_text = f"{coin_name}: 未知"
 

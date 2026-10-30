@@ -324,6 +324,13 @@ def push_alerts(alerts, scan_id=None):
                     vol_ratio=data.get("vol_ratio"),
                     news_status=("ok" if news_text else "empty_or_failed"))
 
+                # Passive candidate observation: no model, message or executor calls.
+                try:
+                    from clients.radar_shadow import record_candidate
+                    record_candidate(_ev, scan_id, coin_name, data, decision)
+                except Exception:
+                    _ev("radar_shadow_error", scan_id=scan_id, coin=coin_name)
+
                 # ── 失败分类（2026-10-15 修正）──
                 # A) 模型通道全挂（"所有模型调用失败"）→ 这才是"AI 不可用"，提醒一次并跳过
                 # B) 只是输出解析不出来（通道是通的）→ 不算通道故障，只记日志，本次按 HOLD 处理
@@ -598,7 +605,7 @@ def _ai_health_reset() -> None:
 
 
 def _fetch_coin_news(coin_name, news_cache, cache_file, today):
-    """从 CoinTelegraph RSS 获取真实新闻 + 免费模型提炼"""
+    """从 CoinTelegraph RSS 获取真实新闻，不调用新闻提炼模型"""
     import requests as _req
     import json
     import re as _re
@@ -644,40 +651,7 @@ def _fetch_coin_news(coin_name, news_cache, cache_file, today):
 
         news_text = "\n---\n".join(raw_news) if raw_news else ""
 
-        # 用免费模型提炼（仅当有原始新闻时）
-        if news_text:
-            from wechat_config import AI_API_KEY
-            APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
-            prompt = (
-                "You are a crypto analyst. Here are the latest real news just fetched:\n"
-                + news_text + "\n"
-                + "Based on these real news, briefly summarize market sentiment for "
-                + coin_name + " in Chinese, within 150 chars."
-            )
-            headers = {
-                "Authorization": f"Bearer {AI_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            if APP_CODE:
-                headers["APP-Code"] = APP_CODE
-            resp = _req.post(
-                "https://api.aihubmix.com/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": "gpt-4.1-nano-free",
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                text = resp.json()["choices"][0]["message"]["content"].replace("**", "")
-                news_cache[cache_key] = {"text": text, "time": now}
-                with open(cache_file, "w") as f:
-                    json.dump(news_cache, f)
-                log(f"已获取真实新闻并缓存{coin_name}的市场点评")
-                return text
-
-        # AI 调用失败或没有新闻时，返回原始新闻
+        # 直接使用 RSS 原始新闻，不再调用 AIHubMix。
         if raw_news:
             fallback = "\U0001f4f0 Latest News:\n" + "\n".join(raw_news[:2])
             news_cache[cache_key] = {"text": fallback, "time": now}
@@ -719,17 +693,37 @@ def start_protection_worker(stop):
     return worker
 
 
+def review_held_positions():
+    # Opt-in. Both radar and periodic calls share the committee coordinator.
+    if os.environ.get("POSITION_REVIEW_ENABLED", "0") != "1":
+        return
+    from clients.position_review import review_cycle
+    from clients.gateio_trade import _get_holdings
+    from crypto_monitor import WATCHLIST
+    from seven_roles_committee import run_committee
+    try:
+        review_cycle(WATCHLIST, _get_holdings(), None, time.time(), run_committee, _ev)
+    except Exception as exc:
+        _ev("position_review_error", error_type=type(exc).__name__)
+
+
 def monitor_loop():
     import threading
     stop = threading.Event()
     worker = start_protection_worker(stop)
-    log("实时异动监控已启动；纸面风险保护独立运行")
+    try:
+        from clients.gateio_trade import DRY_RUN as _DRY
+        _mode = "纸面(DRY_RUN=True)" if _DRY else "实盘(DRY_RUN=False)"
+    except Exception:
+        _mode = "未知"
+    log("实时异动监控已启动；交易模式: " + _mode)
     try:
         while True:
             try:
                 alerts, scan_id = check_alerts()
                 if alerts:
                     push_alerts(alerts, scan_id=scan_id)
+                review_held_positions()
                 time.sleep(MONITOR_INTERVAL)
             except KeyboardInterrupt:
                 break

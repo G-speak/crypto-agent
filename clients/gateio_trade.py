@@ -34,7 +34,9 @@ from collections import OrderedDict
 from decimal import Decimal
 
 # ── 全局安全开关 ──
-DRY_RUN = True
+# 2026-10-22：默认实盘（用户要求 AI 自主下单）。GATEIO_DRY_RUN=1 仅供离线测试强制纸面。
+_DRY_ENV = os.environ.get("GATEIO_DRY_RUN", "").strip()
+DRY_RUN = _DRY_ENV not in ("", "0", "false", "False")
 
 _logger = logging.getLogger("gateio_trade")
 _logger.setLevel(logging.INFO)
@@ -42,6 +44,7 @@ _ch = logging.StreamHandler()
 _ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 if not _logger.handlers:
     _logger.addHandler(_ch)
+_logger.info("交易模式: %s" % ("纸面(DRY_RUN=True)" if DRY_RUN else "实盘(DRY_RUN=False)"))
 
 # 本地模拟时 .env 路径
 _ENV_PATH = os.path.expanduser("~/.hermes/gateio.env")
@@ -401,6 +404,122 @@ def _check_symbol(symbol: str) -> str:
 
 # ==================== 主入口 ====================
 
+def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, current_qty=0.0):
+    """真实市价单 + 成交回读。仅在 DRY_RUN=False 时调用。
+
+    约定：success=True 只代表"交易所已接受订单"；是否真成交看 exchange_confirmed。
+    任何不确定都如实返回 False/False 并写明原因，绝不假装成交。
+    """
+    out = {"success": False, "detail": "", "status": "live_failed",
+           "fill_price": 0.0, "quantity": 0.0, "pnl_pct": 0.0, "pnl_usdt": 0.0,
+           "order_id": None, "exchange_confirmed": False}
+    try:
+        import ccxt
+    except ImportError:
+        out["detail"] = "ccxt 未安装，无法实盘下单"
+        return out
+    env = _load_env()
+    api_key = env.get("GATEIO_API_KEY", "")
+    api_secret = env.get("GATEIO_API_SECRET", "")
+    if not api_key or not api_secret:
+        out["detail"] = "GATEIO_API_KEY/GATEIO_API_SECRET 未配置，无法实盘下单"
+        return out
+    try:
+        exchange = ccxt.gate({"apiKey": api_key, "secret": api_secret,
+                              "enableRateLimit": True,
+                              "options": {"defaultType": "spot"}})
+        exchange.load_markets()
+        if ccxt_symbol not in exchange.markets:
+            out["detail"] = f"Gate.io 不支持该交易对: {ccxt_symbol}"
+            return out
+        market = exchange.markets[ccxt_symbol]
+        side = "buy" if action.upper() == "BUY" else "sell"
+        ticker = exchange.fetch_ticker(ccxt_symbol)
+        price = float(ticker["last"])
+
+        if side == "buy":
+            _bal0 = exchange.fetch_balance()
+            free_usdt = float(((_bal0.get("free") or {}).get("USDT") or 0))
+            if free_usdt <= 0:
+                out["status"] = "no_usdt"
+                out["detail"] = "交易所可用 USDT 为 0，无法买入"
+                return out
+            if percentage > 0:
+                amount_usdt = round(free_usdt * percentage / 100.0, 2)
+                _logger.info("[实盘] 可用 USDT=%.2f，BUY %d%% -> %.2f USDT"
+                             % (free_usdt, percentage, amount_usdt))
+            min_cost = float((market.get("limits", {}).get("cost", {}) or {}).get("min") or 0)
+            if amount_usdt < min_cost:
+                out["status"] = "below_min_cost"
+                out["detail"] = (f"下单金额 {amount_usdt:.2f} USDT 低于交易所最小 "
+                                 f"{min_cost:g} USDT，已取消（未下单）")
+                return out
+            raw_amount = amount_usdt / price
+        else:
+            bal = exchange.fetch_balance()
+            free_base = float(((bal.get("free") or {}).get(ccxt_symbol.split("/")[0]) or 0))
+            if free_base <= 0:
+                out["status"] = "skipped_no_holdings"
+                out["detail"] = f"交易所可用 {coin_name} 为 0，拒绝 SELL"
+                return out
+            raw_amount = free_base * percentage / 100.0
+
+        raw_amount = float(exchange.amount_to_precision(ccxt_symbol, raw_amount))
+        if raw_amount <= 0:
+            out["status"] = "zero_amount"
+            out["detail"] = "按精度取整后下单数量为 0，已取消（未下单）"
+            return out
+
+        # Validate rounded SELL size before any submission; never enlarge it.
+        if side == "sell":
+            limits = market.get("limits") or {}
+            min_amount = float((limits.get("amount") or {}).get("min") or 0)
+            min_cost = float((limits.get("cost") or {}).get("min") or 0)
+            if raw_amount < min_amount or raw_amount * price < min_cost:
+                out["status"] = "below_min_cost"
+                out["detail"] = (f"计划卖出 {raw_amount:g} {coin_name}，估值 {raw_amount * price:.4f} USDT；"
+                                 f"低于交易所最低数量 {min_amount:g} 或金额 {min_cost:g} USDT，未提交订单")
+                return out
+
+        params = {"symbol": ccxt_symbol, "side": side, "amount": raw_amount}
+        if side == "buy":
+            params["price"] = price   # Gate 市价买单必须带 price，否则 ccxt 直接抛 InvalidOrder
+        order = exchange.create_market_order(**params)
+        oid = order.get("id")
+        out.update({"success": True, "status": "submitted", "order_id": oid,
+                    "detail": f"已提交市价单 {side} {raw_amount} {coin_name}（订单 {oid}）"})
+
+        for _ in range(5):
+            try:
+                o = exchange.fetch_order(oid, ccxt_symbol)
+            except Exception:
+                time.sleep(1)
+                continue
+            filled = float(o.get("filled") or 0)
+            if filled > 0:
+                cost = float(o.get("cost") or 0)
+                avg = float(o.get("average") or (cost / filled if filled else 0)) or price
+                out.update({"quantity": filled, "fill_price": avg,
+                            "exchange_confirmed": True, "status": "filled",
+                            "detail": (f"成交 {side} {filled} {coin_name} @ {avg:g}，"
+                                       f"金额约 {cost:.2f} USDT（订单 {oid}）")})
+                return out
+            if o.get("status") in ("canceled", "expired", "rejected"):
+                out.update({"success": False, "status": "rejected",
+                            "detail": f"交易所返回状态 {o.get('status')}（订单 {oid}）"})
+                return out
+            time.sleep(1)
+        out["status"] = "unconfirmed"
+        out["detail"] = (f"已提交但 5 秒内未确认成交，结果未知（订单 {oid}），"
+                         f"请到 Gate.io 核对")
+        return out
+    except Exception as e:
+        out["success"] = False
+        out["status"] = "exception"
+        out["detail"] = f"实盘下单异常: {type(e).__name__}: {e}"
+        return out
+
+
 def execute_order(symbol: str, action: str, amount_usdt: float = 10,
                   coin_name: str = "", percentage: int = 0, request_id=None) -> dict:
     """
@@ -427,18 +546,15 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
           "pnl_usdt": float,     # SELL 平仓绝对盈亏 USDT（非 SELL 为 0）
         }
     """
+    # Freeze this request's mode before any callback/account read. A mutable
+    # global changing mid-request must never turn a paper order into a live one.
+    paper_mode = DRY_RUN is True
     result = {
         "success": False, "action": action, "detail": "",
         "fill_price": 0.0, "quantity": 0.0,
         "pnl_pct": 0.0, "pnl_usdt": 0.0,
     }
 
-    # Live execution deliberately remains unavailable in this staging release.
-    # This is an interlock, not authentication against a same-user/root attacker.
-    if DRY_RUN is not True:
-        result["detail"] = "实盘执行尚未开放：授权执行器与成交核实未验收"
-        result["status"] = "blocked_live"
-        return result
     try:
         validate_command({"action": action, "percentage": percentage, "reason": "executor validation"})
         if type(symbol) is not str or not symbol.strip():
@@ -467,9 +583,15 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
     if not coin_name:
         coin_name = ccxt_symbol.split("/")[0]
 
-    # ── 仓位检查 ──
+    # ── 仓位检查（实盘读交易所，纸面读虚拟账本）──
     coin_base = ccxt_symbol.split("/")[0]
-    holdings = _paper_holdings()
+    try:
+        holdings = _paper_holdings() if paper_mode else get_real_holdings()
+    except Exception as _he:
+        result["detail"] = "获取真实持仓失败，已取消下单: %s: %s" % (type(_he).__name__, _he)
+        result["status"] = "holdings_unavailable"
+        _logger.error(result["detail"])
+        return result
     current_qty = holdings.get(coin_base, {}).get("quantity", 0.0)
 
     # 空仓 SELL → 快速拦截（不触发委员会，直接返回）
@@ -486,12 +608,20 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
     # 下⾯不再检查 BUY 时是否已有持仓
 
     # Budget, FIFO, fees, risk latches and fill recording are one SQLite transaction.
-    extra = {"request_id": request_id} if request_id is not None else {}
-    trade_result = _paper_trade(ccxt_symbol, coin_name, action, amount_usdt,
-                                percentage=percentage, current_qty=current_qty, **extra)
-    result.update(trade_result)
-    result["status"] = trade_result.get("status", "paper_filled" if result.get("success") else "paper_rejected")
-    result["exchange_confirmed"] = False
+    if paper_mode:
+        extra = {"request_id": request_id} if request_id is not None else {}
+        trade_result = _paper_trade(ccxt_symbol, coin_name, action, amount_usdt,
+                                    percentage=percentage, current_qty=current_qty, **extra)
+        result.update(trade_result)
+        result["status"] = trade_result.get("status",
+                                            "paper_filled" if result.get("success") else "paper_rejected")
+        result["exchange_confirmed"] = False
+        return result
+
+    # ── 实盘：真实市价单 ──
+    live_result = _live_trade(ccxt_symbol, coin_name, action, amount_usdt,
+                              percentage=percentage, current_qty=current_qty)
+    result.update(live_result)
     return result
 
 
