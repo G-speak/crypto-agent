@@ -1,3 +1,6 @@
 clients/mom.json
 *.bak
 __pycache__/
+spcx_observer/config.json
+spcx_observer/state/
+logs/

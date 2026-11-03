@@ -46,3 +46,12 @@ PUSH_TIMES = _cfg.get("push_times", ["08:00"])
 
 # 客户端名称（用于日志/文件路径）
 CLIENT_NAME = _cfg.get("name", CLIENT)
+
+# Explicit callback allowlist; empty/malformed configuration denies all messages.
+_callback_users = _cfg.get("callback_allowed_users", [])
+CALLBACK_ALLOWED_USERS = (frozenset(_callback_users)
+                          if type(_callback_users) is list
+                          and all(type(user) is str and user and user != "@all" for user in _callback_users)
+                          else frozenset())
+
+NOTIFICATIONS_ENABLED = _cfg.get("notifications_enabled") is True

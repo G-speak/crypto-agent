@@ -12,6 +12,8 @@ import math
 import requests
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from clients.trade_policy import parse_command
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
@@ -19,7 +21,40 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # 接入 Hermes 核心组件
 from wechat_push import send_simple_message
+from clients import gateio_trade as trade_executor
 from clients.gateio_trade import execute_order, _get_holdings, DRY_RUN, get_real_balance, _get_initial_capital_usdt
+
+# ====== 结构化决策日志（P0-5，2026-10-22）======
+# 只做观测：写盘失败不影响任何决策；_ROLE_CALLS 仅记录本次委员会各角色调用的元数据。
+try:
+    from clients import decision_log as dlog
+except Exception:
+    try:
+        import decision_log as dlog
+    except Exception:
+        dlog = None
+
+_ROLE_CALLS = []
+
+
+def _ev(kind, **fields):
+    try:
+        if dlog is not None:
+            dlog.event(kind, **fields)
+    except Exception:
+        pass
+
+
+def _remember(role, model, t0, status, err="", chars=0):
+    """记录一次角色调用的元数据（不参与任何逻辑）。"""
+    try:
+        _ROLE_CALLS.append({
+            "role": role, "model": model,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "status": status, "err": str(err)[:120], "chars": chars,
+        })
+    except Exception:
+        pass
 
 # 从配置文件读取 Yunwu API KEY
 YUNWU_API_KEY = os.environ.get("YUNWU_API_KEY", "")   # 不落真实密钥；服务器从 clients/mom.json 读取
@@ -326,6 +361,24 @@ ROLE_MODELS = {
 AGENT_MAX_TOKENS = 1500
 
 
+@dataclass(frozen=True)
+class RoleResult:
+    ok: bool
+    text: str = ""
+    error: str = ""
+
+
+class CommitteeUnavailable(Exception):
+    pass
+
+
+def require_role(role, result):
+    if (type(result) is not RoleResult or result.ok is not True
+            or type(result.text) is not str or not result.text.strip()):
+        raise CommitteeUnavailable("必需角色失败: " + role)
+    return result.text
+
+
 def ask_agent(role_name, prompt, model=None, max_retries=2, coin_name=None):
     # 未显式指定模型时，按角色名查 ROLE_MODELS（默认 gpt-5.6-luna）
     if not model:
@@ -338,6 +391,7 @@ def ask_agent(role_name, prompt, model=None, max_retries=2, coin_name=None):
     headers = {"Authorization": f"Bearer {YUNWU_API_KEY}", "Content-Type": "application/json"}
     models = [model] + [m for m in AGENT_MODEL_CHAIN if m != model]
     last_err = ""
+    _t_agent = time.time()
     for use_model in models:
         payload = {
             "model": use_model,
@@ -352,54 +406,26 @@ def ask_agent(role_name, prompt, model=None, max_retries=2, coin_name=None):
             try:
                 response = requests.post(YUNWU_URL, headers=headers, json=payload, timeout=30)
                 if response.status_code != 200:
-                    last_err = f"HTTP {response.status_code} {(response.text or '')[:80]}"
+                    last_err = f"HTTP {response.status_code}"
                     break              # 明确的 HTTP 错误（429/404/5xx）→ 直接换下一个模型
                 txt = (response.json()["choices"][0]["message"]["content"] or "").strip()
                 if txt:
-                    return txt
+                    _remember(role_name, use_model, _t_agent, "ok", chars=len(txt))
+                    return RoleResult(True, txt)
                 last_err = "空回复"
             except Exception as e:
-                last_err = f"{type(e).__name__}: {str(e)[:80]}"
+                last_err = type(e).__name__
                 time.sleep((attempt + 1) * 2)
         print(f"⚠️ [7角色] {role_name} 模型 {use_model} 失败: {last_err}")
     print(f"❌ [7角色] {role_name} 全部模型失败: {last_err}")
-    if role_name == "trader": return '{"action": "HOLD", "reason": "API异常，风控强制观望"}'
-    return f"[{role_name} 分析失败]"
+    _remember(role_name, model, _t_agent, "failed", err=last_err)
+    return RoleResult(False, error="role_unavailable")
 
 
 def parse_json_safely(text):
-    """尽力从模型输出里解析出 {action, percentage, reason}。
-    2026-10-15：旧版只有 json.loads + 贪婪正则，模型带前后缀/嵌套花括号时直接判"解析指令失败"，
-    整段投研就被中止了（用户看到"前面几层都正常、最后报错"）。这里补上非贪婪匹配 + 字段级兜底。"""
-    if not text or not str(text).strip():
-        return {"action": "HOLD", "reason": "解析指令失败"}
-    t = str(text).strip()
-    if t.startswith("\x60\x60\x60json"): t = t[7:]
-    elif t.startswith("\x60\x60\x60"): t = t[3:]
-    if t.endswith("\x60\x60\x60"): t = t[:-3]
-    t = t.strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        pass
-    for pat in (r'\{[^{}]*\}', r'\{.*?\}', r'\{.*\}'):
-        m = re.search(pat, t, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except Exception:
-                continue
-    # 字段级兜底：JSON 坏了也把 action/percentage/reason 抠出来
-    act = re.search(r'"?action"?\s*[:：]\s*"?\s*(BUY|SELL|HOLD)', t, re.IGNORECASE)
-    if act:
-        pct = re.search(r'"?percentage"?\s*[:：]\s*(\d{1,3})', t)
-        rea = re.search(r'"?reason"?\s*[:：]\s*"?([^"\n}]+)', t)
-        return {
-            "action": act.group(1).upper(),
-            "percentage": int(pct.group(1)) if pct else 0,
-            "reason": (rea.group(1).strip() if rea else "未识别原因"),
-        }
-    return {"action": "HOLD", "reason": "解析指令失败"}
+    """Compatibility name; accepts only a complete, unambiguous strict command."""
+    return parse_command(text)
+
 
 # ── 企业微信推送长度/markdown 保护（2026-10-15 加）──────────────
 # 企业微信 text 消息上限 2048 字节（中文 3 字节/字），超长会被静默截断；
@@ -429,8 +455,42 @@ def _clip(t, n: int) -> str:
 
 
 # ====== 4. 主调用入口 ======
-def run_committee(coin_name, symbol, radar_reason=""):
-    """由 alert_monitor 触发的深度投研"""
+def run_committee(coin_name, symbol, radar_reason="", scan_id=None, review_only=False, trigger="radar",
+                  outcome=None):
+    """返回值仍是 bool（兼容旧调用）；原因码写进 outcome，供上层区分报警文案。"""
+    def note(code, detail=""):
+        if outcome is not None:
+            outcome["reason"] = code
+            outcome["detail"] = str(detail)[:300]
+
+    try:
+        if os.environ.get("POSITION_REVIEW_ENABLED", "0") == "1":
+            from clients.committee_coordination import coordinated_run
+            try:
+                return coordinated_run(coin_name, symbol, radar_reason, scan_id, review_only,
+                                       trigger, _run_committee, _ev, outcome=outcome)
+            except (ValueError, OSError, RuntimeError):
+                raise CommitteeUnavailable("委员会协调状态不可用") from None
+        ok = _run_committee(coin_name, symbol, radar_reason, scan_id, review_only=review_only)
+        note("ok" if ok is True else ("data_unavailable" if ok is None else "incomplete"))
+        return ok
+    except CommitteeUnavailable as exc:
+        msg = str(exc)
+        code = "ai_failure" if msg.startswith("必需角色失败") else "committee_blocked"
+        _ev("committee_blocked", scan_id=scan_id, coin=coin_name, reason=msg[:200], code=code)
+        note(code, msg)
+        return False
+
+
+def _run_committee(coin_name, symbol, radar_reason="", scan_id=None, review_only=False, execution_guard=None):
+    """由雷达或持仓复评触发；可显式只评估，默认沿用原执行器。"""
+    committee_id = dlog.new_id("c") if dlog else "c-local"
+    try:
+        _ROLE_CALLS.clear()
+    except Exception:
+        pass
+    _ev("committee_start", committee_id=committee_id, scan_id=scan_id,
+        coin=coin_name, symbol=symbol, radar_reason=str(radar_reason)[:200])
     print(f"🚀 [7角色委员会] 被唤醒，开始深度评估 {coin_name}...")
     send_simple_message(f"🚀 {coin_name} 触发雷达信号，7 角色投研委员会启动...")
 
@@ -455,31 +515,28 @@ def run_committee(coin_name, symbol, radar_reason=""):
         print(f"⚠️ [7角色] 调用 analyze_symbol 失败，退回轻量抓取: {_e}")
 
     market_data, current_price = fetch_real_crypto_data(gate_symbol, rich=rich)
-    if not market_data: 
+    if not market_data:
         send_simple_message(f"❌ {coin_name} 数据抓取失败，委员会解散")
         print("❌ 数据抓取失败，委员会解散")
         return
-        
+
     news_data = fetch_real_crypto_news(coin_name)
-    
-    # 从 Hermes 原生账本获取真实持仓
-    holdings = _get_holdings()
-    coin_base = coin_name.upper()
-    current_qty = holdings.get(coin_base, {}).get("quantity", 0.0)
-    mock_position = f"已持仓 (数量: {current_qty})" if current_qty > 0 else "空仓 (0)"
 
-    # 可用资金（供风控经理按正常比例算仓位：实盘读真实余额，失败则退回配置本金）
+    from clients.position_review import position_context, position_text, validate_account
     try:
-        if DRY_RUN:
-            avail_usdt = float(_get_initial_capital_usdt())
-        else:
-            avail_usdt = float((get_real_balance().get("USDT") or {}).get("free", 0) or 0)
-        if avail_usdt <= 0:
-            avail_usdt = float(_get_initial_capital_usdt())
-    except Exception as _e:
-        print(f"⚠️ 读取可用资金失败，退回配置本金: {_e}")
-        avail_usdt = float(_get_initial_capital_usdt())
+        # Keep the existing paper seed validation; spending uses ledger cash.
+        if trade_executor.DRY_RUN is True:
+            seed = float(_get_initial_capital_usdt())
+            if not math.isfinite(seed) or seed <= 0:
+                raise ValueError("invalid_paper_capital")
+        context = position_context(coin_name.upper(), current_price)
+        validate_account(context)
+        mock_position = position_text(coin_name, context)
+        avail_usdt = float(context['available_usdt'])
+    except (ValueError, TypeError, RuntimeError, KeyError):
+        raise CommitteeUnavailable("账户快照不可用") from None
 
+    market_data += "\n【持仓证据】\n" + mock_position
     comprehensive_prompt = f"【数据】\n{market_data}\n\n【新闻】\n{news_data}"
 
     # ── 方案A 升级版（2026-10-17）：穿透传递 —— 把拼好的完整原始行情数值文本
@@ -489,64 +546,81 @@ def run_committee(coin_name, symbol, radar_reason=""):
 
     # ===== ⏳ 第一层：情报搜集分析中... =====
     send_simple_message(f"⏳ 第一层：情报搜集分析中...\n📈【技术分析师】🔍 分析 {coin_name} 技术指标...\n📰【基本面分析师】🔍 解读最新消息面...\n🎭【情绪分析师】🔍 嗅探市场情绪...")
-    tech = ask_agent("tech_analyst", market_data, ROLE_MODELS["tech_analyst"], coin_name=coin_name)
-    fund = ask_agent("fund_analyst", comprehensive_prompt, ROLE_MODELS["fund_analyst"], coin_name=coin_name)
-    sent = ask_agent("sent_analyst", comprehensive_prompt, ROLE_MODELS["sent_analyst"], coin_name=coin_name)
+    tech = require_role("tech_analyst", ask_agent("tech_analyst", market_data, ROLE_MODELS["tech_analyst"], coin_name=coin_name))
+    fund = require_role("fund_analyst", ask_agent("fund_analyst", comprehensive_prompt, ROLE_MODELS["fund_analyst"], coin_name=coin_name))
+    sent = require_role("sent_analyst", ask_agent("sent_analyst", comprehensive_prompt, ROLE_MODELS["sent_analyst"], coin_name=coin_name))
 
-    # 快速失败：第一层 3 个角色全挂 = AI 通道坏了，立刻中止（省掉后面 4 次无效调用）
-    if all("分析失败" in str(_t) for _t in (tech, fund, sent)):
-        print(f"❌ {coin_name} 委员会中止：第一层 3 个角色 AI 调用全部失败")
-        return False   # 交给 alert_monitor 统一"首次失败提醒"
-        
     # ===== ⏳ 第二层：红蓝激烈对抗中... =====
     send_simple_message(f"⏳ 第二层：红蓝激烈对抗中...\n🐂【多头研究员】🛡️ 构建做多逻辑\n🐻【空头研究员】⚔️ 构建做空逻辑")
     combined = f"技术面：{tech}\n基本面：{fund}\n情绪面：{sent}"
-    bull = ask_agent("bull_researcher", raw_block + combined, ROLE_MODELS["bull_researcher"], coin_name=coin_name)
-    bear = ask_agent("bear_researcher", raw_block + combined, ROLE_MODELS["bear_researcher"], coin_name=coin_name)
-    
+    bull = require_role("bull_researcher", ask_agent("bull_researcher", raw_block + combined, ROLE_MODELS["bull_researcher"], coin_name=coin_name))
+    bear = require_role("bear_researcher", ask_agent("bear_researcher", raw_block + combined, ROLE_MODELS["bear_researcher"], coin_name=coin_name))
+
     # ===== ⏳ 第三层：风控大脑思考中... =====
     send_simple_message(f"⏳ 第三层：风控大脑思考中...\n⚖️【风控经理】🧠 综合多空辩论与持仓状态进行裁决")
     debate = (f"{raw_block}多头：{bull}\n空头：{bear}\n当前状态：{mock_position}。"
-              f"账户可用资金约 {avail_usdt:.2f} USDT。请严格遵守铁律。")
-    risk = ask_agent("risk_manager", debate, ROLE_MODELS["risk_manager"], coin_name=coin_name)
-    
+              f"账户可用资金约 {avail_usdt:.2f} USDT。零现金不妨碍评估已有持仓的卖出。"
+              f"成本不是价格必须回归的目标，不得仅因亏损要求继续持有。请严格遵守铁律。")
+    risk = require_role("risk_manager", ask_agent("risk_manager", debate, ROLE_MODELS["risk_manager"], coin_name=coin_name))
+
     # ===== ⏳ 第四层：交易员执行... =====
     send_simple_message(f"⏳ 第四层：交易员执行...\n👨‍💻【交易员】⚙️ 将风控裁决转化为交易指令")
-    trader_raw = ask_agent("trader", risk, ROLE_MODELS["trader"], coin_name=coin_name)
-    trade_cmd = parse_json_safely(trader_raw)
+    trader_raw = require_role("trader", ask_agent("trader", raw_block + "风控裁决：" + risk,
+                                                 ROLE_MODELS["trader"], coin_name=coin_name))
+    try:
+        trade_cmd = parse_json_safely(trader_raw)
+    except (ValueError, TypeError):
+        raise CommitteeUnavailable("交易指令无效") from None
     action = trade_cmd.get("action", "HOLD").upper()
     reason = trade_cmd.get("reason", "无")
 
-    # ── 失败分类（2026-10-15 修正：区分"AI 真失败"与"只是输出格式没解析出来"）──
-    # A) AI 真的调用失败（角色整段没拿到结果）→ 中止 + 交给调用方"首次失败提醒"，不下单、不推假报告
-    _ai_call_failed = any(m in str(risk) for m in ("分析失败", "API异常"))
-    if _ai_call_failed:
-        _failed_n = sum(1 for _t in (tech, fund, sent, bull, bear, risk) if "分析失败" in str(_t))
-        print(f"❌ {coin_name} 委员会中止：风控 AI 调用失败（{_failed_n}/7 角色失败），不下单、不推报告")
-        return False   # 交给调用方 alert_monitor 统一"首次失败提醒"
-    # B) 只是交易员输出格式没解析出来（模型是通的）→ 不中止：按"观望、不下单"照样出报告
-    if "解析指令失败" in str(reason):
-        print(f"⚠️ {coin_name} 交易员输出无法解析（原文前 200 字）: {trader_raw[:200]}")
-        trade_cmd = {"action": "HOLD", "percentage": 0,
-                     "reason": f"交易员输出格式异常，本次按观望处理、未下单（风控原话: {str(risk)[:100]}）"}
-        action = "HOLD"
-        reason = trade_cmd["reason"]
-    # ==============================================================
+    percentage = trade_cmd["percentage"]
+    _ev("committee_decision", committee_id=committee_id, scan_id=scan_id, coin=coin_name,
+        action=action, percentage=percentage, reason=str(reason)[:300],
+        roles=list(_ROLE_CALLS))
 
-    percentage = trade_cmd.get("percentage", 0)
-    if not isinstance(percentage, int) or percentage < 0 or percentage > 100:
-        percentage = 0
-    elif action == "BUY" and percentage > MAX_BUY_PCT:
-        # 正常比例风控兜底：买入仓位超上限时压回（SELL 不受限，允许 100 清仓）
-        print(f"⚠️ BUY 仓位 {percentage}% 超过上限 {MAX_BUY_PCT}%，已压回")
-        percentage = MAX_BUY_PCT
-    
     # ===== 执行决策并记录账本 =====
     trade_result = {"action": "HOLD", "pnl_pct": 0, "pnl_usdt": 0}
     pnl_msg = f"⚪ 投研判定风险过高，维持观望。\n(初筛理由: {radar_reason})"
-    
-    if action in ["BUY", "SELL"]:
-        trade_result = execute_order(symbol, action, amount_usdt=10, coin_name=coin_name, percentage=percentage)
+
+    if review_only:
+        pnl_msg = f"持仓复评建议: {action}（仓位建议 {percentage}%）；本次仅评估，未提交订单。"
+        _ev("committee_review_only", scan_id=scan_id, coin=coin_name, action=action,
+            percentage=percentage)
+    elif action in ["BUY", "SELL"]:
+        try:
+            validate_account(context, action)
+        except ValueError:
+            raise CommitteeUnavailable("账户不满足交易方向要求") from None
+        # Persist intent before submission when coordination is enabled, then
+        # reconcile private order/fill evidence. Unknown outcomes stay latched.
+        request_id = ("committee:" + str(scan_id) + ":" + coin_name + ":" + action) if scan_id else None
+        if execution_guard is not None:
+            try:
+                execution_guard.prepare(coin_name.upper() + '/USDT', action, percentage, request_id)
+            except (ValueError, OSError, RuntimeError):
+                raise CommitteeUnavailable("订单意图未能安全记录，拒绝发送") from None
+        try:
+            trade_result = execute_order(symbol, action, amount_usdt=10, coin_name=coin_name,
+                                         percentage=percentage, request_id=request_id)
+            if execution_guard is not None:
+                trade_result = execution_guard.observe(trade_result)
+        except Exception as _oe:
+            _ev("order_result", committee_id=committee_id, scan_id=scan_id, coin=coin_name,
+                action=action, percentage=percentage, dry_run=DRY_RUN,
+                status="exception", success=False, exchange_confirmed=False,
+                error=("%s: %s" % (type(_oe).__name__, _oe))[:300],
+                detail="下单函数抛出异常，成交结果未知（未经交易所核实）")
+            raise
+        _ok_flag = bool((trade_result or {}).get("success"))
+        _ev("order_result", committee_id=committee_id, scan_id=scan_id, coin=coin_name, action=action,
+            percentage=percentage, dry_run=DRY_RUN,
+            status=("returned_success" if _ok_flag else "returned_failure"),
+            success=_ok_flag,
+            exchange_confirmed=bool((trade_result or {}).get("exchange_confirmed")),
+            detail=str((trade_result or {}).get("detail"))[:400],
+            fill_price=(trade_result or {}).get("fill_price"),
+            quantity=(trade_result or {}).get("quantity"))
 
         dr_note = " (DRY RUN 模拟)" if DRY_RUN else ""
         ok = bool(trade_result.get("success"))
@@ -556,20 +630,25 @@ def run_committee(coin_name, symbol, radar_reason=""):
         act_cn = "买入" if action == "BUY" else "卖出"
         act_emoji = "🟢" if action == "BUY" else "🔴"
 
-        if not ok:
+        if trade_result.get("status") == "unconfirmed":
+            pnl_msg = f"⚠️ 深度判定{act_cn}，成交结果未知。\n{detail or '请核对交易所订单，禁止重发。'}"
+        elif not ok:
             # 下单失败必须如实说明并带上原因，绝不能显示成"已成交 0"
             pnl_msg = (f"⚠️ 深度判定{act_cn}，但未能成交（拟用仓位 {percentage}%）{dr_note}\n"
                        f"❗ 原因: {detail or '下单返回失败，详见服务器日志'}")
+        elif trade_executor.DRY_RUN is not True and trade_result.get("exchange_confirmed") is not True:
+            pnl_msg = (f"⚠️ 深度判定{act_cn}，订单已提交但未确认成交\n"
+                       f"❗ {detail or '结果未知'}，请到 Gate.io 核对")
         elif action == "BUY":
-            pnl_msg = (f"{act_emoji} 深度判定买入，已成交！\n"
+            pnl_msg = (f"{act_emoji} 深度判定买入，成交！\n"
                        f"   动用仓位 {percentage}% ｜ 成交价 ${fill_price:,.2f} ｜ 数量 {qty} ｜ 约 {fill_price * qty:.2f} USDT{dr_note}")
         else:
             pnl_pct = trade_result.get("pnl_pct", 0) or 0
             sign = "+" if pnl_pct > 0 else ""
             tail = f"\n💸 模拟平仓收益: {sign}{pnl_pct:.2f}%" if (DRY_RUN and pnl_pct != 0) else ""
-            pnl_msg = (f"{act_emoji} 深度判定卖出，已成交！\n"
+            pnl_msg = (f"{act_emoji} 深度判定卖出，成交！\n"
                        f"   动用仓位 {percentage}% ｜ 成交价 ${fill_price:,.2f} ｜ 数量 {qty}{dr_note}{tail}")
-    
+
     # ===== 组装最终微信报告 =====
     # 2026-10-15：企业微信单条文本上限 2048 字节（中文 3 字节/字），超了会被微信静默截断
     # （用户实测：多头写了一大段 Markdown，结果报告尾部"风控拍板/账户动态"整段丢失）。
@@ -594,10 +673,27 @@ def run_committee(coin_name, symbol, radar_reason=""):
             break
         wechat_text = _build(_bn, _rn)
 
-    send_simple_message(wechat_text)
-    print(f"✅ {coin_name} 委员会决议已推送（{len(wechat_text.encode('utf-8'))} 字节）。")
+    if send_simple_message(wechat_text) is True:
+        print(f"✅ {coin_name} 委员会决议已推送（{len(wechat_text.encode('utf-8'))} 字节）。")
+    else:
+        print(f"❌ {coin_name} 委员会决议发送失败；请检查微信发送日志。")
+    # 返回值仍表示委员会已完成；发送失败不能被误报为 AI 失败或触发交易重试。
     return True
 
 if __name__ == "__main__":
-    # 本地跑单测
+    # P0-1（2026-10-22）：本入口会走完整链路并下单，默认禁用。
+    # 需显式 SELFTEST=1 才运行，且强制纸面模式 + 屏蔽微信推送，避免误触实盘/打扰用户。
+    import os as _os
+    if _os.environ.get("SELFTEST") != "1":
+        print("⛔ 已禁用：该入口会触发真实下单。设置 SELFTEST=1 才会运行（且强制 DRY_RUN=True）。")
+        raise SystemExit(0)
+    try:
+        import clients.gateio_trade as _gt
+        _gt.DRY_RUN = True
+        DRY_RUN = True
+        send_simple_message = lambda *a, **k: print("[selftest] 已屏蔽微信推送")
+    except Exception as _e:
+        print(f"⛔ 自测模式初始化失败，为安全中止: {_e}")
+        raise SystemExit(2)
+    print("⚠️ 自测模式：DRY_RUN 强制为 True，微信推送已屏蔽")
     run_committee("ETH", "ethusdt", "单测运行")

@@ -12,11 +12,12 @@ from email.mime.text import MIMEText
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ====== 配置 ======
-ALARM_EMAIL = "1127923801@qq.com"
-SMTP_HOST = "smtp.qq.com"
+ALARM_EMAIL = os.environ.get("CRYPTO_ALARM_EMAIL", "")
+SMTP_HOST = os.environ.get("CRYPTO_SMTP_HOST", "smtp.qq.com")
 SMTP_PORT = 587
-SMTP_USER = "1127923801@qq.com"
-SMTP_PASS = "hwfzvakwjhwkgcej"
+SMTP_USER = os.environ.get("CRYPTO_SMTP_USER", "")
+SMTP_PASS = os.environ.get("CRYPTO_SMTP_PASS", "")
+EMAIL_ENABLED = os.environ.get("CRYPTO_EMAIL_ENABLED") == "1"
 
 COOLDOWN_FILE = os.path.expanduser("~/.hermes/alert_cooldown.json")
 LOG_FILE = os.path.expanduser("~/.hermes/logs/alert_monitor.log")
@@ -46,6 +47,8 @@ def save_json(path, data):
 
 def send_email(subject, body):
     """发送告警邮件"""
+    if EMAIL_ENABLED is not True or not all((SMTP_USER, SMTP_PASS, ALARM_EMAIL)):
+        return False
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = SMTP_USER
@@ -144,22 +147,22 @@ def check_processes():
 def health_check():
     """执行一次全面健康检查，返回(ok, details)"""
     issues = []
-    
+
     # 1. 检查API余额
     if not check_api_balance():
         issues.append("DeepSeek余额检查异常")
-    
+
     # 2. 检查进程
     if not check_processes():
         issues.append("有进程未运行")
-    
+
     # 3. 记录健康状态
     state = load_json(HEALTH_FILE)
     state["last_check"] = time.time()
     state["ok"] = len(issues) == 0
     state["issues"] = issues
     save_json(HEALTH_FILE, state)
-    
+
     return len(issues) == 0, issues
 
 if __name__ == "__main__":

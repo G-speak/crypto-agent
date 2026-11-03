@@ -11,12 +11,14 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ==================== 配置 ====================
-from wechat_config import CORPID, AGENTID, SECRET, TOUSER
+from wechat_config import CORPID, AGENTID, SECRET, TOUSER, NOTIFICATIONS_ENABLED
 
 BASE_URL = "https://qyapi.weixin.qq.com"
 
 def get_token():
     """获取企业微信 access_token"""
+    if NOTIFICATIONS_ENABLED is not True:
+        raise RuntimeError("notifications_disabled")
     url = f"{BASE_URL}/cgi-bin/gettoken"
     resp = requests.get(url, params={
         "corpid": CORPID,
@@ -30,6 +32,8 @@ def get_token():
 
 def send_text(token, content, touser=TOUSER):
     """发送纯文本消息"""
+    if NOTIFICATIONS_ENABLED is not True:
+        raise RuntimeError("notifications_disabled")
     url = f"{BASE_URL}/cgi-bin/message/send"
     payload = {
         "touser": touser,
@@ -69,6 +73,8 @@ def push_analysis(analysis_texts, chart_paths, touser=TOUSER):
         print(f"✅", end=" ")
     except Exception as e:
         print(f"❌ Ai消息推送失败: {e}", end=" ")
+        print()
+        return False
 
     print()
     return True

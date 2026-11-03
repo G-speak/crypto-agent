@@ -17,11 +17,15 @@ from flask import Flask, request, make_response
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from clients import callback_guard
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 65536
 
 # ==================== 配置 ====================
-from wechat_config import TOKEN, ENCODING_AES_KEY, CORPID, AGENTID, SECRET, PORT
+from wechat_config import TOKEN, ENCODING_AES_KEY, CORPID, AGENTID, SECRET, PORT, CALLBACK_ALLOWED_USERS
 CORPSECRET = SECRET
+REPLAY_FILE = os.path.expanduser("~/.hermes/callback_guard/seen.sqlite3")
 
 LOG_FILE = os.path.expanduser("~/.hermes/logs/wechat_callback.log")
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -98,32 +102,18 @@ def log(msg):
 # ==================== AES 加解密 ====================
 
 def decrypt_aes(encoding_aes_key, msg_encrypt):
-    """解密企业微信消息"""
-    aes_key = base64.b64decode(encoding_aes_key + "=")
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(aes_key[:16]))
-    decryptor = cipher.decryptor()
-    decrypted = decryptor.update(base64.b64decode(msg_encrypt)) + decryptor.finalize()
-
-    pad_len = decrypted[-1]
-    content = decrypted[:-pad_len]
-
-    msg_len = int.from_bytes(content[16:20], byteorder="big")
-    msg = content[20:20+msg_len]
-    receive_id = content[20+msg_len:].decode("utf-8")
-
-    return msg.decode("utf-8"), receive_id
+    return callback_guard.decrypt(encoding_aes_key, msg_encrypt, CORPID), CORPID
 
 
 def encrypt_aes(encoding_aes_key, msg, receive_id):
     """加密回复消息"""
-    import random
     aes_key = base64.b64decode(encoding_aes_key + "=")
 
     # 构建明文: [16字节随机][4字节长度][消息][企业ID]
-    rand_str = "".join(chr(random.randint(65, 90)) for _ in range(16))
+    rand_bytes = os.urandom(16)
     msg_bytes = msg.encode("utf-8")
     msg_len = len(msg_bytes)
-    raw = rand_str.encode() + msg_len.to_bytes(4, byteorder="big") + msg_bytes + receive_id.encode()
+    raw = rand_bytes + msg_len.to_bytes(4, byteorder="big") + msg_bytes + receive_id.encode()
 
     # PKCS7 填充
     block_size = 32
@@ -177,7 +167,7 @@ def handle_message(content, from_user):
             current_watchlist = [(k, v) for k, v in wl.items()]
         else:
             current_watchlist = [("BTC","btcusdt"),("ETH","ethusdt"),("SOL","solusdt"),("BNB","bnbusdt")]
-        
+
         # Step 1: Keyword-based coin detection (fast, no AI call)
         matched_coin = None
         content_upper = content.upper()
@@ -185,7 +175,7 @@ def handle_message(content, from_user):
             if c_name in content_upper or c_sym.replace("usdt","").upper() in content_upper:
                 matched_coin = c_name
                 break
-        
+
         # Step 2: Fetch data only for the relevant coin(s)
         if matched_coin:
             from crypto_monitor import analyze_symbol as _analyze
@@ -332,27 +322,27 @@ def handle_add_coin(coin, user_id):
     """添加币种到监控"""
     coin = coin.upper().strip()
     watchlist = _read_watchlist()
-    
+
     if coin in watchlist:
         return f"⚠️ {coin} 已经在监控列表里了"
-    
+
     symbol = f"{coin.lower()}usdt"
     watchlist[coin] = symbol
     _save_watchlist(watchlist)
-    
+
     return f"✅ 已加入 {coin} 监控！\n当前监控: {', '.join(watchlist.keys())}"
 
 def handle_remove_coin(coin, user_id):
     """从监控移除币种"""
     coin = coin.upper().strip()
     watchlist = _read_watchlist()
-    
+
     if coin not in watchlist:
         return f"⚠️ {coin} 不在监控列表中"
-    
+
     del watchlist[coin]
     _save_watchlist(watchlist)
-    
+
     return f"✅ 已移除 {coin} 监控\n当前监控: {', '.join(watchlist.keys()) if watchlist else '无'}"
 
 
@@ -366,86 +356,47 @@ def wechat_callback():
 
 
 def handle_get():
-    """处理 URL 验证"""
-    msg_signature = request.args.get("msg_signature", "")
-    timestamp = request.args.get("timestamp", "")
-    nonce = request.args.get("nonce", "")
-    echostr = request.args.get("echostr", "")
-
-    my_sign = verify_signature(TOKEN, timestamp, nonce, echostr)
-    if my_sign != msg_signature:
-        log(f"⚠️ 签名不匹配: 计算={my_sign[:16]}..., 期望={msg_signature[:16]}...")
-
+    """Reject failed URL verification; never echo unverified ciphertext."""
     try:
-        decrypted, receive_id = decrypt_aes(ENCODING_AES_KEY, echostr)
-        log(f"URL验证成功")
-        resp = make_response(decrypted)
-        resp.headers["Content-Type"] = "text/plain"
-        return resp
-    except Exception as e:
-        log(f"解密失败: {e}")
-        resp = make_response(echostr)
-        resp.headers["Content-Type"] = "text/plain"
-        return resp
+        echo = request.args.get("echostr", "")
+        if len(request.args.getlist("echostr")) != 1 or not echo or len(echo) > 65536:
+            raise callback_guard.CallbackRejected("invalid_echo")
+        callback_guard.check_signature(TOKEN, request.args, echo)
+        clear = callback_guard.decrypt(ENCODING_AES_KEY, echo, CORPID)
+        response = make_response(clear)
+        response.headers["Content-Type"] = "text/plain"
+        return response
+    except callback_guard.CallbackRejected:
+        return make_response("forbidden", 403)
+
+
+def _dispatch_reply(user_id, user_msg):
+    """Only authenticated, authorized, newly claimed messages reach here."""
+    import threading
+    def reply_later():
+        try:
+            reply = handle_message(user_msg, user_id)
+            push_to_user(user_id, reply)
+        except Exception:
+            # No raw message, reply, request body or exception credentials in logs.
+            log("callback reply failed")
+    thread = threading.Thread(target=reply_later, daemon=True)
+    thread.start()
 
 
 def handle_post():
-    """处理用户发来的消息"""
-    body = request.get_data(as_text=True)
-    log(f"\n=== 收到POST消息 ===")
-    log(f"Body: {body[:500]}")
-
-    # 解析 XML
     try:
-        root = ET.fromstring(body)
-
-        # 获取加密信息
-        encrypt_node = root.find("Encrypt")
-        if encrypt_node is None:
-            log("没有 Encrypt 节点")
+        user, content, digest = callback_guard.authenticate_text(
+            request.get_data(as_text=True), request.args, TOKEN, ENCODING_AES_KEY,
+            CORPID, AGENTID, CALLBACK_ALLOWED_USERS)
+    except callback_guard.CallbackRejected:
+        return make_response("forbidden", 403)
+    try:
+        if not callback_guard.claim_message(REPLAY_FILE, digest):
             return make_response("ok")
-
-        encrypt_xml = encrypt_node.text
-
-        # 解密
-        msg_text, receive_id = decrypt_aes(ENCODING_AES_KEY, encrypt_xml)
-        log(f"解密消息: {msg_text}")
-
-        # 解析解密后的 XML
-        msg_root = ET.fromstring(msg_text)
-        content = msg_root.find("Content")
-        from_user = msg_root.find("FromUserName")
-
-        if content is not None:
-            user_msg = content.text
-            user_id = from_user.text if from_user is not None else "unknown"
-            log(f"用户 {user_id}: {user_msg}")
-
-            # 处理消息（在后台线程执行，不影响回调响应）
-            import threading
-            def reply_later(uid, msg):
-                try:
-                    reply = handle_message(msg, uid)
-                    log(f"回复: {reply}")
-                    time.sleep(1)
-                    # 主动推送给用户
-                    push_result = push_to_user(uid, reply)
-                    log(f"推送结果: {push_result}")
-                except Exception as e:
-                    log(f"回复推送异常: {e}")
-
-            t = threading.Thread(target=reply_later, args=(user_id, user_msg))
-            t.daemon = True
-            t.start()
-
-            # 立即返回 ok（企业微信收到空响应表示消息已接收）
-            resp = make_response("ok")
-            resp.headers["Content-Type"] = "text/plain"
-            return resp
-
-    except Exception as e:
-        log(f"处理POST异常: {e}")
-
+        _dispatch_reply(user, content)
+    except Exception:
+        return make_response("unavailable", 503)
     return make_response("ok")
 
 

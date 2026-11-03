@@ -8,8 +8,33 @@ import traceback
 from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Diagnostics must exit before importing configuration or creating state/log files.
+if __name__ == "__main__" and "--once" in sys.argv:
+    from offline_diagnostic import main as _offline_main
+    raise SystemExit(_offline_main())
+
 # ====== 配置 ======
 from wechat_config import MAJOR_COINS, ALERT_COOLDOWN, MONITOR_INTERVAL, CLIENT_NAME
+
+# ====== 结构化决策日志（P0-5，2026-10-22）======
+# 只做观测：decision_log 内部吞掉所有异常，写盘失败不影响任何决策或返回值。
+try:
+    from clients import decision_log as dlog
+except Exception:
+    try:
+        import decision_log as dlog
+    except Exception:
+        dlog = None
+
+
+def _ev(kind, **fields):
+    """安全写事件（永不抛异常）。"""
+    try:
+        if dlog is not None:
+            dlog.event(kind, **fields)
+    except Exception:
+        pass
+
 
 LOG_FILE = os.path.expanduser(f"~/.hermes/logs/alert_monitor_{CLIENT_NAME}.log")
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
@@ -36,17 +61,86 @@ def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f)
 
-def is_on_cooldown(coin, alert_type, cooldown):
+# ====== 单实例锁（P0-1，2026-10-22）======
+# 目的：阻止 `--once` 与常驻服务、或两个服务实例并行共用 alert_state/cooldown 文件。
+# 约定：拿不到锁或锁机制异常均拒绝启动。离线 --once 在配置导入前退出，不共用状态。
+LOCK_FILE = os.path.expanduser(f"~/.hermes/crypto_alert_{CLIENT_NAME}.lock")
+_LOCK_FH = None
+LOCK_ERROR = ""
+
+
+def acquire_single_instance_lock():
+    """P0-A：fail-closed 单实例锁。
+    只有"确实拿到 flock"才返回 True；fcntl 不可用 / 锁文件打不开 / 加锁异常
+    一律返回 False（调用方必须拒绝启动），不再"记个警告就放行"。
+    锁文件用 a+ 非截断方式打开，避免抢锁失败时把持锁进程写入的 PID 清空。
+    """
+    global _LOCK_FH, LOCK_ERROR
+    LOCK_ERROR = ""
+    try:
+        import fcntl
+    except Exception as e:
+        LOCK_ERROR = f"fcntl 不可用: {type(e).__name__}: {e}"
+        return False
+    try:
+        fh = open(LOCK_FILE, "a+", encoding="utf-8")   # 非截断
+    except Exception as e:
+        LOCK_ERROR = f"锁文件无法打开: {type(e).__name__}: {e}"
+        return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        LOCK_ERROR = "已有实例持锁"
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        LOCK_ERROR = f"加锁异常: {type(e).__name__}: {e}"
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+    # 只有确实拿到锁之后，才更新 PID（此前不清空既有内容）
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except Exception as e:
+        log(f"⚠️ 锁已取得，但写入 PID 失败: {e}")
+    _LOCK_FH = fh          # 持有到进程结束；进程退出时内核自动释放
+    return True
+
+
+def is_on_cooldown(coin, alert_type, cooldown, scan_id=None):
     key = f"{coin}:{alert_type}"
     now = time.time()
     if key in cooldown and now - cooldown[key] < ALERT_COOLDOWN:
+        # P0-5：被冷却压制的信号此前完全不可见，这里只记日志，不改变行为
+        _ev("cooldown_suppressed", scan_id=scan_id, coin=coin, rule=alert_type,
+            remaining_s=int(ALERT_COOLDOWN - (now - cooldown[key])))
         return True
     cooldown[key] = now
     return False
 
-def check_alerts():
+def check_alerts(scan_id=None):
+    """执行一轮巡检，返回 **二元组 (alerts, scan_id)**。
+
+    兼容性决策（2026-10-22 第四轮，明确化）：
+      · 本函数返回值由 list 变更为 (list, str)，属于**有意的不兼容变更**，
+        目的是彻底移除模块级 _CURRENT_SCAN_ID 全局、消除并发串号风险；
+      · 仓库内调用点已全部改为元组解包（alert_monitor.py 的 monitor_loop 与 --once）；
+      · 若外部集成方仍需要旧的"只返回 list"行为，请改用兼容垫片
+        check_alerts_legacy()，不要直接依赖本函数的一次返回。
+      · scan_id 由调用方显式传入；不传则内部生成并随返回值带出。
+    """
     from crypto_monitor import WATCHLIST, analyze_symbol
 
+    scan_id = scan_id or (dlog.new_id("s") if dlog else "s-local")
+    _snapshots = []
     state = load_json(STATE_FILE)
     cooldown = load_json(COOLDOWN_FILE)
     alerts = []
@@ -67,13 +161,14 @@ def check_alerts():
             vol_threshold = 3.0 if is_major else 7.0
 
             prev = state.get(coin_name, {})
+            _n0 = len(alerts)
 
             # 1. 价格波动预警 (相对上次检查)
             if prev and "price" in prev and prev["price"] > 0:
                 pct = abs(price - prev["price"]) / prev["price"] * 100
                 if pct >= vol_threshold:
                     direction = "上涨" if price > prev["price"] else "下跌"
-                    if not is_on_cooldown(coin_name, "price_spike", cooldown):
+                    if not is_on_cooldown(coin_name, "price_spike", cooldown, scan_id=scan_id):
                         alerts.append(
                             f"🚨 {coin_name} 价格异动\n"
                             f"当前: ${price:,.2f}\n"
@@ -84,7 +179,7 @@ def check_alerts():
                         )
 
             # 2. RSI超卖/超买
-            if rsi <= 25 and not is_on_cooldown(coin_name, "rsi_oversold", cooldown):
+            if rsi <= 25 and not is_on_cooldown(coin_name, "rsi_oversold", cooldown, scan_id=scan_id):
                 alerts.append(
                     f"⚠️ {coin_name} RSI超卖\n"
                     f"价: ${price:,.2f}  RSI: {rsi:.1f}\n"
@@ -92,7 +187,7 @@ def check_alerts():
                     f"短期可能反弹，注意风险\n"
                     f"⏰ {now_str}"
                 )
-            elif rsi >= 75 and not is_on_cooldown(coin_name, "rsi_overbought", cooldown):
+            elif rsi >= 75 and not is_on_cooldown(coin_name, "rsi_overbought", cooldown, scan_id=scan_id):
                 alerts.append(
                     f"⚠️ {coin_name} RSI超买\n"
                     f"价: ${price:,.2f}  RSI: {rsi:.1f}\n"
@@ -103,14 +198,14 @@ def check_alerts():
 
             # 3. 布林带突破
             if bb_l > 0 and bb_u > 0:
-                if price <= bb_l and not is_on_cooldown(coin_name, "bb_lower", cooldown):
+                if price <= bb_l and not is_on_cooldown(coin_name, "bb_lower", cooldown, scan_id=scan_id):
                     alerts.append(
                         f"📉 {coin_name} 跌破布林下轨\n"
                         f"价: ${price:,.2f}  下轨: ${bb_l:,.2f}\n"
                         f"RSI: {rsi:.1f}  24h: {change:+.2f}%\n"
                         f"⏰ {now_str}"
                     )
-                elif price >= bb_u and not is_on_cooldown(coin_name, "bb_upper", cooldown):
+                elif price >= bb_u and not is_on_cooldown(coin_name, "bb_upper", cooldown, scan_id=scan_id):
                     alerts.append(
                         f"📈 {coin_name} 涨破布林上轨\n"
                         f"价: ${price:,.2f}  上轨: ${bb_u:,.2f}\n"
@@ -119,6 +214,15 @@ def check_alerts():
                     )
 
             state[coin_name] = {"price": price, "time": time.time()}
+            try:
+                _snapshots.append({
+                    "coin": coin_name, "price": price, "rsi": round(float(rsi), 1),
+                    "bb": [round(float(bb_l), 2), round(float(bb_u), 2)],
+                    "chg_24h": round(float(change), 2),
+                    "alerts_fired": len(alerts) - _n0,
+                })
+            except Exception:
+                pass
 
         except Exception as e:
             log(f"检查 {coin_name} 出错: {e}")
@@ -126,7 +230,16 @@ def check_alerts():
 
     save_json(STATE_FILE, state)
     save_json(COOLDOWN_FILE, cooldown)
+    _ev("scan", scan_id=scan_id, coins=_snapshots, alerts=len(alerts),
+        interval_s=MONITOR_INTERVAL)
+    return alerts, scan_id
+
+def check_alerts_legacy(scan_id=None):
+    """兼容垫片：只返回 alerts（丢弃 scan_id），供仍按旧签名集成的外部调用方使用。
+    内部代码不要用它（内部一律用 check_alerts() 的二元组，保证 scan_id 不丢）。"""
+    alerts, _sid = check_alerts(scan_id=scan_id)
     return alerts
+
 
 # ══════════════════════════════════════════════════════════════
 # 预警推送总开关（2026-10-11 用户要求：暂停「📈预警 + 📊简析 + 💤交易决策」这条推送）
@@ -136,19 +249,10 @@ def check_alerts():
 COIN_ALERT_PUSH_ENABLED = False
 
 
-def push_alerts(alerts):
+def push_alerts(alerts, scan_id=None):
     if not alerts:
         return
-    # ══════════════════════════════════════════════════════════
-    # yunwu.ai 连通性探测：不可用时跳过本轮全部推送，
-    # 避免向用户推送一堆 "AI 调用失败" 的无效消息。
-    # （任何 HTTP 响应都算网络可达；只有超时/断连才算不可用）
-    # ══════════════════════════════════════════════════════════
-    if not _is_yunwu_ready():
-        log(f"⛔ yunwu.ai 不可达，跳过本轮 {len(alerts)} 条预警推送（AI 不可用）")
-        _notify_ai_down_once(len(alerts))   # 只在"正常→失败"那一次提醒用户
-        return
-
+    # Call the actual candidate models; a single-model ping cannot gate all AI.
     from wechat_push import send_simple_message
     from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     import requests as _req, json as _json
@@ -204,13 +308,26 @@ def push_alerts(alerts):
                 decision = ask_ai_json(build_json_prompt(data, coin_name, news_text))
                 action = decision.get("action", "HOLD")
                 reason = decision.get("reason", "")
+                _ev("shallow_decision", scan_id=scan_id, coin=coin_name, action=action,
+                    reason=str(reason)[:200], price=data.get("price"),
+                    rsi=data.get("rsi"), bb_lower=data.get("bb_lower"),
+                    bb_upper=data.get("bb_upper"), chg_24h=data.get("change_24h"),
+                    vol_ratio=data.get("vol_ratio"),
+                    news_status=("ok" if news_text else "empty_or_failed"))
+
+                # Passive candidate observation: no model, message or executor calls.
+                try:
+                    from clients.radar_shadow import record_candidate
+                    record_candidate(_ev, scan_id, coin_name, data, decision)
+                except Exception:
+                    _ev("radar_shadow_error", scan_id=scan_id, coin=coin_name)
 
                 # ── 失败分类（2026-10-15 修正）──
                 # A) 模型通道全挂（"所有模型调用失败"）→ 这才是"AI 不可用"，提醒一次并跳过
                 # B) 只是输出解析不出来（通道是通的）→ 不算通道故障，只记日志，本次按 HOLD 处理
                 if "所有模型调用失败" in reason:
                     log(f"⚠️ {coin_name} AI 通道调用失败: {reason}")
-                    _notify_ai_down_once(len(alerts), detail=reason)
+                    _notify_ai_down_once(len(alerts), detail=str(decision.get("ai_error") or reason))
                     continue
                 if "解析失败" in reason:
                     log(f"⚠️ {coin_name} 浅层决策输出无法解析（模型可用，本次按 HOLD 处理）: {reason}")
@@ -228,16 +345,27 @@ def push_alerts(alerts):
                     )
                     send_simple_message(alert_msg)
                     log(f"触发浅层 {action} 信号，正在唤醒 7 角色")
+                    _ev("committee_wake", scan_id=scan_id, coin=coin_name, action=action,
+                        reason=str(reason)[:200])
 
                     try:
                         import seven_roles_committee
-                        _ok = seven_roles_committee.run_committee(coin_name, symbol, reason)
-                        if _ok is False:
-                            # 委员会中途因 AI 调用失败中止 → 只提醒一次（不推假报告）
+                        _outcome = {}
+                        _ok = seven_roles_committee.run_committee(
+                            coin_name, symbol, reason, scan_id=scan_id, outcome=_outcome)
+                        _why = _outcome.get("reason") or ("ok" if _ok else "incomplete")
+                        if _ok is False and _why == "ai_failure":
+                            # 只有模型真的调用失败才报 AI
                             log(f"❌ {coin_name} 7角色投研因 AI 调用失败中止")
                             _notify_ai_down_once(len(alerts), detail="7 角色投研中途失败（AI 调用异常），本次未给出交易结论，也未下单")
+                        elif _ok is False and _why == "unresolved_order":
+                            log(f"🔒 {coin_name} 被未知订单安全锁拦截，本轮未下单/未唤醒 AI")
+                            _notify_lock_once(detail=_outcome.get("detail") or "存在未决订单")
+                        elif _ok is False:
+                            log(f"⚠️ {coin_name} 7角色本轮未完成（{_why}）：{_outcome.get('detail') or '无交易结论'}")
                         else:
                             _ai_health_reset()
+                            _lock_notice_reset()
                     except Exception as e:
                         err_msg = f"{chr(0x26a0)}{chr(0xfe0f)} 7角色深度投研唤醒失败: {e}"
                         log(err_msg)
@@ -248,7 +376,7 @@ def push_alerts(alerts):
                 # =======================================================
 
                 # ── 预警推送总开关（2026-10-11 用户暂停）──
-                # 只跳过"简析 + 下单 + 推送"这一段：不调 AI（省 token）、不发消息、不下单。
+                # 只跳过下方旧版简析、直接下单和推送；上方结构化初筛仍会调用 AI。
                 # 雷达触发/7角色深度投研在上方，照常工作。
                 if not COIN_ALERT_PUSH_ENABLED:
                     log(f"[预警推送已暂停] {coin_name} 浅层决策={action}，跳过简析/下单/推送")
@@ -454,15 +582,69 @@ def _notify_ai_down_once(n_alerts: int = 0, detail: str = "") -> None:
         from wechat_push import send_simple_message
         reason = detail or _YUNWU_LAST_ERROR or "未知原因"
         send_simple_message(
-            f"⚠️ AI 分析通道调用失败\n"
+            f"⚠️ 本轮 AI 分析未完成\n"
             f"🕐 时间: {ts}\n"
             f"❗ 原因: {reason}\n"
-            f"📉 影响: 这期间的行情分析和 7 角色投研无法进行（价格监测照常跑，但没有 AI 判断）\n"
+            f"📉 影响: 本轮相应分析未完成；价格扫描继续。此结果不代表全部模型不可用，也不代表交易已恢复。\n"
             f"（连续失败不再重复提醒；AI 恢复后若再失败会再提醒一次）"
         )
         log(f"⚠️ 已推送 AI 首次失败提醒: {reason}")
     except Exception as e:
         log(f"AI 失败提醒推送失败: {e}")
+
+
+LOCK_NOTICE_FILE = os.path.expanduser("~/.hermes/lock_notice_state.json")
+
+
+def _lock_notice_load() -> dict:
+    try:
+        with open(LOCK_NOTICE_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _lock_notice_save(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(LOCK_NOTICE_FILE), exist_ok=True)
+        tmp = LOCK_NOTICE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, LOCK_NOTICE_FILE)
+    except Exception as e:
+        log(f"安全锁提醒状态写入失败: {e}")
+
+
+def _notify_lock_once(detail: str = "") -> None:
+    """未知订单安全锁只提醒一次，避免每 5 分钟刷屏；锁解除后由 _lock_notice_reset 复位。"""
+    st = _lock_notice_load()
+    if st.get("notified"):
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st.update(notified=True, at=ts, detail=str(detail)[:200])
+    _lock_notice_save(st)
+    try:
+        from wechat_push import send_simple_message
+        send_simple_message(
+            f"🔒 存在未决订单，交易安全锁已阻止本轮下单\n"
+            f"🕐 时间: {ts}\n"
+            f"❗ 原因: {detail or '存在未决订单'}\n"
+            f"📉 影响: 7 角色本轮未启动，未下单；价格扫描继续。\n"
+            f"（安全锁未解除前不再重复提醒）"
+        )
+        log(f"🔒 已推送安全锁提醒: {detail[:80]}")
+    except Exception as e:
+        log(f"安全锁提醒推送失败: {e}")
+
+
+def _lock_notice_reset() -> None:
+    st = _lock_notice_load()
+    if st.get("notified"):
+        st["notified"] = False
+        st["released_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        _lock_notice_save(st)
+        log("🔓 安全锁已解除，提醒状态复位")
 
 
 def _ai_health_reset() -> None:
@@ -476,7 +658,7 @@ def _ai_health_reset() -> None:
 
 
 def _fetch_coin_news(coin_name, news_cache, cache_file, today):
-    """从 CoinTelegraph RSS 获取真实新闻 + 免费模型提炼"""
+    """从 CoinTelegraph RSS 获取真实新闻，不调用新闻提炼模型"""
     import requests as _req
     import json
     import re as _re
@@ -496,7 +678,7 @@ def _fetch_coin_news(coin_name, news_cache, cache_file, today):
             "https://cointelegraph.com/rss",
         ]
         rss_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        
+
         for url in urls:
             try:
                 r = _req.get(url, headers=rss_headers, timeout=10)
@@ -522,47 +704,14 @@ def _fetch_coin_news(coin_name, news_cache, cache_file, today):
 
         news_text = "\n---\n".join(raw_news) if raw_news else ""
 
-        # 用免费模型提炼（仅当有原始新闻时）
-        if news_text:
-            from wechat_config import AI_API_KEY
-            APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
-            prompt = (
-                "You are a crypto analyst. Here are the latest real news just fetched:\n"
-                + news_text + "\n"
-                + "Based on these real news, briefly summarize market sentiment for "
-                + coin_name + " in Chinese, within 150 chars."
-            )
-            headers = {
-                "Authorization": f"Bearer {AI_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            if APP_CODE:
-                headers["APP-Code"] = APP_CODE
-            resp = _req.post(
-                "https://api.aihubmix.com/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": "gpt-4.1-nano-free",
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                text = resp.json()["choices"][0]["message"]["content"].replace("**", "")
-                news_cache[cache_key] = {"text": text, "time": now}
-                with open(cache_file, "w") as f:
-                    json.dump(news_cache, f)
-                log(f"已获取真实新闻并缓存{coin_name}的市场点评")
-                return text
-
-        # AI 调用失败或没有新闻时，返回原始新闻
+        # 直接使用 RSS 原始新闻，不再调用 AIHubMix。
         if raw_news:
             fallback = "\U0001f4f0 Latest News:\n" + "\n".join(raw_news[:2])
             news_cache[cache_key] = {"text": fallback, "time": now}
             with open(cache_file, "w") as f:
                 json.dump(news_cache, f)
             return fallback
-            
+
     except Exception as e:
         log(f"获取新闻异常({coin_name}): {e}")
 
@@ -580,34 +729,75 @@ def _execute_trade(coin_name, symbol, action):
     return result
 
 
+def start_protection_worker(stop):
+    import threading
+    def work():
+        from clients.gateio_trade import run_protection_cycle
+        while not stop.is_set():
+            try:
+                outcome = run_protection_cycle()
+                # 实盘下该函数固定返回 live_execution_disabled，不是风险事件，别每 10 秒刷一条
+                if outcome.get("reason") == "live_execution_disabled":
+                    stop.wait(10)
+                    continue
+                if outcome.get("exits") or outcome.get("blocked_new_risk"):
+                    _ev("paper_protection", result=outcome)
+            except Exception as exc:
+                _ev("paper_protection_error", error_type=type(exc).__name__)
+            stop.wait(10)
+    worker = threading.Thread(target=work, name="paper-protection", daemon=True)
+    worker.start()
+    return worker
+
+
+def review_held_positions():
+    # Opt-in. Both radar and periodic calls share the committee coordinator.
+    if os.environ.get("POSITION_REVIEW_ENABLED", "0") != "1":
+        return
+    from clients.position_review import review_cycle
+    from clients.gateio_trade import _get_holdings
+    from crypto_monitor import WATCHLIST
+    from seven_roles_committee import run_committee
+    try:
+        review_cycle(WATCHLIST, _get_holdings(), None, time.time(), run_committee, _ev)
+    except Exception as exc:
+        _ev("position_review_error", error_type=type(exc).__name__)
+
+
 def monitor_loop():
-    log("实时异动监控已启动")
-    log(f"主流币(3%阈值): {MAJOR_COINS}")
-    log(f"检查间隔: {MONITOR_INTERVAL}秒")
-    while True:
-        try:
-            alerts = check_alerts()
-            if alerts:
-                log(f"发现 {len(alerts)} 条预警")
-                push_alerts(alerts)
-            time.sleep(MONITOR_INTERVAL)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log(f"异常: {e}\n{traceback.format_exc()}")
-            time.sleep(1)
+    import threading
+    stop = threading.Event()
+    worker = start_protection_worker(stop)
+    try:
+        from clients.gateio_trade import DRY_RUN as _DRY
+        _mode = "纸面(DRY_RUN=True)" if _DRY else "实盘(DRY_RUN=False)"
+    except Exception:
+        _mode = "未知"
+    log("实时异动监控已启动；交易模式: " + _mode)
+    try:
+        while True:
+            try:
+                alerts, scan_id = check_alerts()
+                if alerts:
+                    push_alerts(alerts, scan_id=scan_id)
+                review_held_positions()
+                time.sleep(MONITOR_INTERVAL)
+            except KeyboardInterrupt:
+                break
+            except Exception as exc:
+                log("巡检失败: " + type(exc).__name__)
+                time.sleep(1)
+    finally:
+        stop.set()
+        worker.join(timeout=1)
+
 
 if __name__ == "__main__":
     import sys
-    if "--once" in sys.argv:
-        log("=== 单次检查 ===")
-        alerts = check_alerts()
-        if alerts:
-            for a in alerts:
-                print(a)
-                print("---")
-            push_alerts(alerts)
-        else:
-            log("本轮无异动")
-    else:
-        monitor_loop()
+
+    # P0-1：单实例锁（常驻服务与 --once 都要先拿到锁）
+    if not acquire_single_instance_lock():
+        log(f"⛔ 单实例保护不可用，拒绝启动（{LOCK_ERROR}；锁文件 {LOCK_FILE}）")
+        sys.exit(1)
+
+    monitor_loop()
