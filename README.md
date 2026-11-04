@@ -1,68 +1,79 @@
-# AI 币助手 🤖💰
+# Crypto Agent — 安全维护版
 
-加密货币监控 + AI 分析机器人，通过企业微信推送实时行情分析和价格异动预警。
+加密货币行情与 AI 研究系统。本分支同步已部署的持仓复评、候选机会观察、订单诊断、AI 初筛降级与分批加仓资金护栏。包含真实订单执行路径；当前代码未设置 GATEIO_DRY_RUN 时默认实盘，离线测试显式设置 GATEIO_DRY_RUN=1。代码同步不包含账户配置或凭据，不保证收益。
 
-## 功能
+## 当前边界
 
-- **定时推送** — 每天 08:00 / 20:00 推送 BTC、ETH、SOL、BNB 的技术面分析（含走势图）
-- **实时异动监控** — 每 5 分钟检查价格波动、RSI 超卖超买、布林带突破
-- **AI 智能分析** — 自动路由：日常分析走 DeepSeek，实时新闻走 Grok，带搜索功能
-- **自动补仓/卖出价位提醒** — 用户可设置价格预警
+- 订单核实工具仅能向固定 Gate 主机发送白名单 GET 请求，不提供下单/撤单接口。
+- 纸面账户以 SQLite 事务保存现金、FIFO 成本、净盈亏和幂等结果；记录模拟手续费及滑点。
+- 纸面止损、回撤和日亏损保护独立于 AI 与普通信号冷却。止损工作线程默认每 10 秒检查一次，网络延迟会延长实际周期；不是交易所托管保护单。
+- `--once` 只做离线源码检查，不读取真实配置、账户、密钥或行情，不写冷却/账本，不发微信。
+- 微信通知默认关闭；回调默认空用户白名单。配置缺失或无效时不放行。
+- 本分支不包含生产配置和密钥。2026-11-05 只读核对确认监控使用实盘模式；本次 GitHub 同步没有部署、重启或触发交易。股票观察器和微信回调服务独立维护。后续 push 不会自动部署。
 
-## 快速开始
+## 最安全的开始方式
 
-### 1. 配置环境变量
+离线检查不需要提供任何真实配置：
 
-```bash
-cp .env.example .env
-# 编辑 .env 填入你的 Key
-vim .env
+```sh
+python3 alert_monitor.py --once
 ```
 
-需要申请：
-1. **企业微信应用** — 在 [work.weixin.qq.com](https://work.weixin.qq.com) 后台创建应用，获取 CORPID、SECRET、TOKEN、ENCODING_AES_KEY
-2. **AIHubMix Key** — 在 [aihubmix.com](https://aihubmix.com) 注册，充值后获取 API Key
-3. **DeepSeek Key** — 在 [platform.deepseek.com](https://platform.deepseek.com) 注册获取
+完整回归在临时副本内运行，自动使用假配置、临时 HOME 和网络阻断，不读取项目中的真实客户端配置：
 
-### 2. 安装依赖
-
-```bash
-pip install requests matplotlib numpy cryptography flask
+```sh
+python3 -m pip install -r requirements.txt
+python3 tools/run_tests.py --json-output artifacts/offline-tests.json
 ```
 
-### 3. 启动服务
+当前测试入口执行 8 套隔离测试，包括 46 项新增加仓/估值/额度/并发测试和 11 月 3 日补丁回归。GitHub Actions 执行同一入口；临时 HOME、虚构配置与网络阻断由入口强制注入。旧的其他专项测试文件保留，但不属于这 8 套的执行清单。计数不代表独立安全属性数量。
 
-```bash
-# 加载环境变量
-export $(grep -v '^#' .env | xargs)
+## 配置
 
-# 启动定时推送 + 预警监控
-python3 server_monitor.py
+运行原有监控入口时，需要在本地将 `clients/example.json` 复制为 `clients/mom.json` 后填写；真实配置被 `.gitignore` 排除，不要提交。`CRYPTO_CLIENT` 默认为 `mom`。不要用测试假配置覆盖已有配置。
 
-# 启动企业微信回调（用户发消息自动回复）
-python3 wechat_server.py
+`notifications_enabled` 默认 false；本交付未开通真实通知。`callback_allowed_users` 默认空数组，只接受明确允许的用户。回调仅支持自建企业应用的文本消息；不支持第三方套件 ReceiveId 语义或其他事件。
+
+## 真实环境只读检查
+
+```sh
+python3 tools/verify_runtime.py
+# 如需读取已有真实账户，凭据必须留在服务器上，文件属主正确、权限为 600：
+python3 tools/verify_runtime.py --env-file /path/to/gateio.env
 ```
 
-## 优惠活动
+只读检查读取公开行情，可选读取账户与已有历史订单，并在临时账户执行模拟往返。它没有真实下单、撤单、微信或 AI 请求。没有近期历史订单时会明确输出 `no_recent_spot_order_available`，不把模拟成交冒充真实成交核实。
 
-本项目已集成 **AIHubMix** 作为模型供应商。如果你也想享受 10% 计费优惠：
+## 交易与风险实现
 
-1. 登录 [aihubmix.com/appstore](https://aihubmix.com/appstore) 申请应用 Code
-2. 在环境变量中设置 `AIHUBMIX_APP_CODE=你的6位Code`
-3. 调用 AIHubMix API 时自动带上 `APP-Code` 请求头
+- `clients/gate_readonly.py`：固定主机、签名 GET、禁止重定向、完整成交分页。
+- `clients/order_journal.py`：幂等意图、已有订单绑定、稳定订单快照、逐笔成交去重、部分成交/撤销/未知状态，手续费保留原币种。
+- `clients/paper_account.py`：事务式纸面账本，禁止损坏账本静默重置；新账本单边模拟费率 0.1%、滑点 0.1%，最小模拟成交额 5 USDT。
+- 纸面保护默认单币止损 5%、账户高水位回撤 10%、日亏损 3%，行情观测有效期 60 秒。以上均为模拟假设，并非已批准的实盘参数。熔断状态持久保存，不自动恢复。行情缺失禁止新增风险；仍允许依据其他新鲜行情执行保护性退出。
+- 所有纸面写入均从同一 SQLite 事务更新，普通交易与风险退出不会超卖或重复入账。执行入口支持 `request_id`，委员会使用扫描 ID 派生幂等请求。
 
-适用模型：所有模型（除 Claude 系列），请求计费 10% 优惠。
+## 已验证与尚未验证
 
-## 项目结构
+2026-10-22：Mac 与 Linux 系统断网隔离测试通过。真实 Gate 公开行情和账户只读访问通过；没有可用近期现货历史订单，未在真实成交上验证核实流程。真实下单/撤单/微信未执行，此前未部署；后续经用户授权已更新监控的纸面运行版本，微信服务修复单独处理。
 
-```
-├── wechat_config.py      # 配置（从环境变量读取）
-├── wechat_push.py         # 企业微信消息推送
-├── wechat_server.py       # 企业微信回调服务 (Flask)
-├── crypto_monitor.py      # 行情数据获取 + AI 分析
-├── alert_monitor.py       # 实时异动监控
-├── price_alerts.py        # 用户自定义价格预警
-├── server_monitor.py      # 服务启动入口
-├── run_monitor.py         # 定时推送循环
-└── .env.example           # 环境变量模板
-```
+真实订单由现有执行器发送；只读模块用于订单及成交核实。POSITION_REVIEW_ENABLED=1 时启用共享委员会协调、持仓复评和未知订单拦截。无订单编号的未知结果仍需人工核实，不会因部署而解除。纸面保护参数不代表实盘止损保护。
+
+已有日志模块仍存在短裸凭据识别、轮转并发和祖先目录信任边界；回调去重是先登记再派发，崩溃可能丢失回复，尚非可恢复队列。详见 `docs/safety-validation.md` 和 `docs/production-rollout-20261022.md`。不要把本分支的测试通过理解为生产安全认证。
+
+## 2026-10-30 同步
+
+- 保留脱敏后的原始执行错误，小额卖出提交前校验最低数量及金额。
+- 为研究提示提供按可用余额与数量精度估算的成交门槛；不自动提高卖出比例。
+- 雷达 HOLD 候选只记录，离线比较后续价格，不新增模型或订单请求。
+- 9 套测试通过，使用假配置并禁用网络。部署配置、运行日志及账户数据库不入库。
+
+## 2026-11-05 同步
+
+- 按线上 `exposure-guard-20261105` 的 Python 源码同步；相关 12 个交付文件哈希一致。
+- 初筛和风控提示允许已有持仓继续 BUY，仍受原有单次买入比例校验；不会因为触及新上限自动 SELL。
+- 新增 BUY 按全部现货资产净值限制单币 60%，并保留至少 20% 净值的可用 USDT；冻结资产与灰尘计入估值，冻结现金不能花。
+- Gate 普通 ticker 没有时间戳，估值改用带交易所时间戳的盘口；缺失/过期估值拒绝新增 BUY，截断后重新校验交易对门槛与精度。
+- 手续费使用账户 taker 费率与 0.5% 预算下限的较大值；预算不是实际收取费率。市价买入明确传入 USDT cost，测试使用 CCXT 4.5.59 的原生请求构造器验证单位。
+- 线程/跨进程执行锁与提交前持久化状态阻止并发透支和不确定订单重发；新增 `executor_allocation.sqlite3` 不得因交易受阻而直接删除。
+- 保留原成交核实模块与历史状态；本次同步不是对全部继承逻辑的安全认证。已知边界见 `docs/exposure-guard-20261105.md`。
+- 新上限只控制本系统提交时的新增买单；价格变动和其他客户端的交易不受本机锁约束。不保证收益或持仓比例始终不超限。
