@@ -252,16 +252,7 @@ COIN_ALERT_PUSH_ENABLED = False
 def push_alerts(alerts, scan_id=None):
     if not alerts:
         return
-    # ══════════════════════════════════════════════════════════
-    # yunwu.ai 连通性探测：不可用时跳过本轮全部推送，
-    # 避免向用户推送一堆 "AI 调用失败" 的无效消息。
-    # （任何 HTTP 响应都算网络可达；只有超时/断连才算不可用）
-    # ══════════════════════════════════════════════════════════
-    if not _is_yunwu_ready():
-        log(f"⛔ yunwu.ai 不可达，跳过本轮 {len(alerts)} 条预警推送（AI 不可用）")
-        _notify_ai_down_once(len(alerts))   # 只在"正常→失败"那一次提醒用户
-        return
-
+    # Call the actual candidate models; a single-model ping cannot gate all AI.
     from wechat_push import send_simple_message
     from crypto_monitor import build_prompt, ask_ai, WATCHLIST
     import requests as _req, json as _json
@@ -336,7 +327,7 @@ def push_alerts(alerts, scan_id=None):
                 # B) 只是输出解析不出来（通道是通的）→ 不算通道故障，只记日志，本次按 HOLD 处理
                 if "所有模型调用失败" in reason:
                     log(f"⚠️ {coin_name} AI 通道调用失败: {reason}")
-                    _notify_ai_down_once(len(alerts), detail=reason)
+                    _notify_ai_down_once(len(alerts), detail=str(decision.get("ai_error") or reason))
                     continue
                 if "解析失败" in reason:
                     log(f"⚠️ {coin_name} 浅层决策输出无法解析（模型可用，本次按 HOLD 处理）: {reason}")
@@ -359,14 +350,22 @@ def push_alerts(alerts, scan_id=None):
 
                     try:
                         import seven_roles_committee
+                        _outcome = {}
                         _ok = seven_roles_committee.run_committee(
-                            coin_name, symbol, reason, scan_id=scan_id)
-                        if _ok is False:
-                            # 委员会中途因 AI 调用失败中止 → 只提醒一次（不推假报告）
+                            coin_name, symbol, reason, scan_id=scan_id, outcome=_outcome)
+                        _why = _outcome.get("reason") or ("ok" if _ok else "incomplete")
+                        if _ok is False and _why == "ai_failure":
+                            # 只有模型真的调用失败才报 AI
                             log(f"❌ {coin_name} 7角色投研因 AI 调用失败中止")
                             _notify_ai_down_once(len(alerts), detail="7 角色投研中途失败（AI 调用异常），本次未给出交易结论，也未下单")
+                        elif _ok is False and _why == "unresolved_order":
+                            log(f"🔒 {coin_name} 被未知订单安全锁拦截，本轮未下单/未唤醒 AI")
+                            _notify_lock_once(detail=_outcome.get("detail") or "存在未决订单")
+                        elif _ok is False:
+                            log(f"⚠️ {coin_name} 7角色本轮未完成（{_why}）：{_outcome.get('detail') or '无交易结论'}")
                         else:
                             _ai_health_reset()
+                            _lock_notice_reset()
                     except Exception as e:
                         err_msg = f"{chr(0x26a0)}{chr(0xfe0f)} 7角色深度投研唤醒失败: {e}"
                         log(err_msg)
@@ -377,7 +376,7 @@ def push_alerts(alerts, scan_id=None):
                 # =======================================================
 
                 # ── 预警推送总开关（2026-10-11 用户暂停）──
-                # 只跳过"简析 + 下单 + 推送"这一段：不调 AI（省 token）、不发消息、不下单。
+                # 只跳过下方旧版简析、直接下单和推送；上方结构化初筛仍会调用 AI。
                 # 雷达触发/7角色深度投研在上方，照常工作。
                 if not COIN_ALERT_PUSH_ENABLED:
                     log(f"[预警推送已暂停] {coin_name} 浅层决策={action}，跳过简析/下单/推送")
@@ -583,15 +582,69 @@ def _notify_ai_down_once(n_alerts: int = 0, detail: str = "") -> None:
         from wechat_push import send_simple_message
         reason = detail or _YUNWU_LAST_ERROR or "未知原因"
         send_simple_message(
-            f"⚠️ AI 分析通道调用失败\n"
+            f"⚠️ 本轮 AI 分析未完成\n"
             f"🕐 时间: {ts}\n"
             f"❗ 原因: {reason}\n"
-            f"📉 影响: 这期间的行情分析和 7 角色投研无法进行（价格监测照常跑，但没有 AI 判断）\n"
+            f"📉 影响: 本轮相应分析未完成；价格扫描继续。此结果不代表全部模型不可用，也不代表交易已恢复。\n"
             f"（连续失败不再重复提醒；AI 恢复后若再失败会再提醒一次）"
         )
         log(f"⚠️ 已推送 AI 首次失败提醒: {reason}")
     except Exception as e:
         log(f"AI 失败提醒推送失败: {e}")
+
+
+LOCK_NOTICE_FILE = os.path.expanduser("~/.hermes/lock_notice_state.json")
+
+
+def _lock_notice_load() -> dict:
+    try:
+        with open(LOCK_NOTICE_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _lock_notice_save(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(LOCK_NOTICE_FILE), exist_ok=True)
+        tmp = LOCK_NOTICE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, LOCK_NOTICE_FILE)
+    except Exception as e:
+        log(f"安全锁提醒状态写入失败: {e}")
+
+
+def _notify_lock_once(detail: str = "") -> None:
+    """未知订单安全锁只提醒一次，避免每 5 分钟刷屏；锁解除后由 _lock_notice_reset 复位。"""
+    st = _lock_notice_load()
+    if st.get("notified"):
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st.update(notified=True, at=ts, detail=str(detail)[:200])
+    _lock_notice_save(st)
+    try:
+        from wechat_push import send_simple_message
+        send_simple_message(
+            f"🔒 存在未决订单，交易安全锁已阻止本轮下单\n"
+            f"🕐 时间: {ts}\n"
+            f"❗ 原因: {detail or '存在未决订单'}\n"
+            f"📉 影响: 7 角色本轮未启动，未下单；价格扫描继续。\n"
+            f"（安全锁未解除前不再重复提醒）"
+        )
+        log(f"🔒 已推送安全锁提醒: {detail[:80]}")
+    except Exception as e:
+        log(f"安全锁提醒推送失败: {e}")
+
+
+def _lock_notice_reset() -> None:
+    st = _lock_notice_load()
+    if st.get("notified"):
+        st["notified"] = False
+        st["released_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        _lock_notice_save(st)
+        log("🔓 安全锁已解除，提醒状态复位")
 
 
 def _ai_health_reset() -> None:
@@ -683,6 +736,10 @@ def start_protection_worker(stop):
         while not stop.is_set():
             try:
                 outcome = run_protection_cycle()
+                # 实盘下该函数固定返回 live_execution_disabled，不是风险事件，别每 10 秒刷一条
+                if outcome.get("reason") == "live_execution_disabled":
+                    stop.wait(10)
+                    continue
                 if outcome.get("exits") or outcome.get("blocked_new_risk"):
                     _ev("paper_protection", result=outcome)
             except Exception as exc:

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import time
@@ -119,15 +120,22 @@ class OrderJournal:
     def __init__(self, path):
         self.path = str(path)
         with database(self.path) as db:
-            db.execute('CREATE TABLE IF NOT EXISTS intents (key TEXT PRIMARY KEY, account TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, request TEXT NOT NULL, order_id TEXT, state TEXT NOT NULL, evidence TEXT, error TEXT, updated REAL NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS intents (key TEXT PRIMARY KEY, account TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, request TEXT NOT NULL, order_id TEXT, state TEXT NOT NULL, evidence TEXT, error TEXT, updated REAL NOT NULL, client_oid TEXT)')
+            _cols = [r[1] for r in db.execute('PRAGMA table_info(intents)')]
+            if 'client_oid' not in _cols:      # 旧库迁移
+                db.execute('ALTER TABLE intents ADD COLUMN client_oid TEXT')
+            db.execute('CREATE INDEX IF NOT EXISTS client_oid_idx ON intents(account,symbol,client_oid)')
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS venue_order ON intents(account,symbol,order_id)')
             db.execute('CREATE TABLE IF NOT EXISTS fills (account TEXT NOT NULL, symbol TEXT NOT NULL, trade_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,symbol,trade_id))')
 
-    def prepare(self, key, account, symbol, side, request):
+    def prepare(self, key, account, symbol, side, request, client_oid=None):
         pair_name(symbol)
         if (type(key) is not str or not 1 <= len(key) <= 128 or not account
                 or side not in ('buy', 'sell') or type(request) is not dict):
             raise ValueError('invalid intent')
+        if client_oid is not None and (type(client_oid) is not str
+                                       or not re.fullmatch(r'[A-Za-z0-9_-]{1,28}', client_oid)):
+            raise ValueError('invalid client_oid')
         payload = canonical(request)
         with database(self.path) as db:
             db.execute('BEGIN IMMEDIATE')
@@ -136,8 +144,9 @@ class OrderJournal:
                 if (row['account'],row['symbol'],row['side'],row['request']) != (account,symbol,side,payload):
                     raise ValueError('idempotency key conflict')
             else:
-                db.execute('INSERT INTO intents VALUES (?,?,?,?,?,NULL,?,NULL,NULL,?)',
-                           (key,account,symbol,side,payload,'prepared',time.time()))
+                db.execute('INSERT INTO intents (key,account,symbol,side,request,order_id,state,'
+                           'evidence,error,updated,client_oid) VALUES (?,?,?,?,?,NULL,?,NULL,NULL,?,?)',
+                           (key,account,symbol,side,payload,'prepared',time.time(),client_oid))
         return self.get(key)
 
     def attach(self, key, order_id):
@@ -198,6 +207,25 @@ class OrderJournal:
 
     def reconcile(self, key, reader):
         row = self.get(key)
+        if not row['order_id'] and row.get('client_oid'):
+            # 没有交易所订单号时，按 text 幂等键反查：查到就补 attach，继续核实
+            found, searched = None, False
+            try:
+                found = reader.order_by_text(row['client_oid'], row['symbol'])
+                searched = True
+            except Exception:
+                searched = False
+            if found and str(found.get('id') or '').isdigit():
+                self.attach(key, str(found['id']))
+                row = self.get(key)
+            elif searched and (time.time() - float(row['updated'] or 0)) > 60:
+                # 明确查无此单且已过 60 秒 → 安全判定为终态（保留记录）
+                with database(self.path) as db:
+                    db.execute('UPDATE intents SET state=?, error=?, updated=? WHERE key=?',
+                               ('cancelled', 'not_found_by_client_oid', time.time(), key))
+                return self.get(key)
+            else:
+                return self.unknown(key)
         if not row['order_id']:
             return self.unknown(key)
         try:

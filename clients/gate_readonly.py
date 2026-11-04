@@ -89,6 +89,20 @@ class GateReadOnly:
             raise ReadOnlyError('invalid_order')
         return row
 
+    def order_by_text(self, text, symbol):
+        """按下单时写入的 text 幂等键反查订单；未找到返回 None，查询失败抛 ReadOnlyError。"""
+        if type(text) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{1,28}', text):
+            raise ValueError('invalid text key')
+        for status in ('open', 'finished'):
+            rows = self._get('/spot/orders', {'currency_pair': pair_name(symbol), 'status': status,
+                                             'account': 'spot', 'limit': 100}, private=True)
+            if type(rows) is not list:
+                raise ReadOnlyError('invalid_orders')
+            for row in rows:
+                if row.get('text') == text:
+                    return row
+        return None
+
     def trades(self, order_id, symbol):
         if type(order_id) is not str or not re.fullmatch(r'[0-9]{1,32}', order_id):
             raise ValueError('invalid order id')

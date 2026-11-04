@@ -91,6 +91,39 @@ def history(reader, coin, now=None):
     return rows
 
 
+DUST_USDT = 3.0   # 与 Gate spot cost.min 对齐；低于该估值的持仓视为不可交易灰尘
+
+
+def is_dust_position(quantity, price):
+    """灰尘判定：有数量但按现价估值不足交易所最小下单额。价格未知时不判定（fail-open）。"""
+    try:
+        q, p = decimal(quantity), decimal(price)
+    except Exception:
+        return False
+    return bool(q > 0 and p > 0 and q * p < decimal(str(DUST_USDT)))
+
+
+def _allocation_context(result, coin, balance=None, account=None):
+    from clients import gateio_trade as trade
+    try:
+        if account is not None:
+            positions=account['positions']; quotes=trade._quotes_for(trade._paper_account())
+            from clients.paper_account import fresh_quote
+            values={p.split('/')[0]:decimal(pos['quantity'])*fresh_quote(quotes,p,time.time(),60)
+                    for p,pos in positions.items()}
+            total=decimal(account['cash'])+sum(values.values(),Decimal(0))
+            snap={'total':total,'asset_values':values}
+        else:
+            snap=trade.calculate_total_net_worth(balance=balance)
+        total=snap['total']; value=snap['asset_values'].get(coin,Decimal(0))
+        if total<=0: raise ValueError('empty_account')
+        result.update(valuation_status='ok', net_worth_usdt=str(total),
+                      market_value_usdt=str(value), exposure_pct=str(value/total*100))
+    except Exception:
+        result.update(valuation_status='unknown')
+    return result
+
+
 def position_context(coin, price=0):
     from clients import gateio_trade as trade
     if not coin.isalpha() or not coin.isascii() or coin != coin.upper():
@@ -104,14 +137,20 @@ def position_context(coin, price=0):
         if qty and decimal(holding.get('total_cost', 0)) > 0:
             cost = decimal(holding['total_cost'])
             result.update(cost_status='paper_ledger', cost_usdt=str(cost), avg_cost=str(cost / qty))
-        return result
+        result['is_dust'] = is_dust_position(qty, price)
+        return _allocation_context(result,coin,account=account)
     balance = trade.get_real_balance()
     if balance is None:
         raise ValueError('balance_unavailable')
     qty = decimal(balance.get(coin, {}).get('total', 0))
     cash = decimal(balance.get('USDT', {}).get('free', 0))
     result = dict(quantity=str(qty), available_usdt=str(cash), cost_status='unknown')
-    if qty:
+    dust = is_dust_position(qty, price)
+    result['is_dust'] = dust
+    if dust:
+        # 灰尘不查历史成本：既卖不掉，也不该参与决策，省一次交易历史查询
+        result.update(cost_status='dust', cost_reason='below_min_notional')
+    elif qty:
         try:
             from clients.gate_readonly import GateReadOnly
             config = trade._load_env()
@@ -123,13 +162,24 @@ def position_context(coin, price=0):
         except Exception:
             result = dict(quantity=str(qty), available_usdt=str(cash), cost_status='unknown',
                           cost_reason='history_unavailable_or_balance_changed')
+    result['is_dust'] = dust
     from clients.execution_constraints import fetch_constraints
     result['execution_constraints'] = fetch_constraints(coin, balance.get(coin, {}).get('free', 0), price)
-    return result
+    return _allocation_context(result,coin,balance=balance)
 
 
 def position_text(coin, context):
+    if context.get('valuation_status')=='ok':
+        allocation=(f"；持仓市值约 {decimal(context['market_value_usdt']):.4f} USDT"
+                    f"（占现货账户总净值 {decimal(context['exposure_pct']):.2f}%）"
+                    f"；全账户净值 {decimal(context['net_worth_usdt']):.4f} USDT（含冻结余额与灰尘）")
+    else:
+        allocation='；全账户估值未知，不得猜测仓位占比；执行器须重新估值后方可 BUY'
+    allocation+='；新增BUY限单币60%且保留20%可用USDT，不自动卖出'
     qty = decimal(context['quantity'])
+    if context.get('is_dust'):
+        return (f"{coin}: 空仓（无有效持仓；账户另有不可交易灰尘 {qty}，"
+                f"估值 < {DUST_USDT:g} USDT，决策时按空仓处理，可正常 BUY，严禁 SELL）" + allocation)
     text = f"{coin}: 数量 {qty}；" + ('有持仓' if qty else '空仓')
     if context['cost_status'] in ('queried_history_estimate', 'paper_ledger'):
         text += f"；均摊成本 {context['avg_cost']} USDT；剩余成本 {context['cost_usdt']} USDT"
@@ -139,10 +189,12 @@ def position_text(coin, context):
     else:
         text += '；成本未知，不得按零成本计算收益'
     text += '；' + context.get('execution_constraints', '成交门槛未提供')
-    return text
+    return text + allocation
 
 
 def validate_account(context, action=None):
+    if action == 'SELL' and context.get('is_dust'):
+        raise ValueError('dust_position_cannot_sell')
     qty, cash = decimal(context['quantity']), decimal(context['available_usdt'])
     if action == 'BUY' and cash <= 0:
         raise ValueError('no_cash_for_buy')
@@ -184,11 +236,27 @@ class ReviewSchedule:
             db.execute('UPDATE reviews SET attempted=MAX(attempted,?) WHERE coin=?', (now, coin))
 
 
+_DUST_LOGGED = set()
+
+
 def review_cycle(watchlist, holdings, schedule, now, run, event):
     """Independent of shallow HOLD; cadence is enforced by the shared entry."""
     for coin, symbol in watchlist:
         try:
-            if decimal(holdings.get(coin, {}).get('quantity', 0)) <= 0:
+            qty = holdings.get(coin, {}).get('quantity', 0)
+            if decimal(qty) <= 0:
+                continue
+            # 灰尘仓位：估值不足交易所最小下单额 → 决策层视同空仓，跳过定期复评
+            try:
+                from clients.gateio_trade import _fetch_current_price
+                dust_price = _fetch_current_price(symbol.upper().replace('USDT', '/USDT'))
+            except Exception:
+                dust_price = 0
+            if is_dust_position(qty, dust_price):
+                if coin not in _DUST_LOGGED:
+                    _DUST_LOGGED.add(coin)
+                    event('position_review_dust_skipped', coin=coin,
+                          detail='估值低于交易所最小下单额，按空仓处理，不再定期复评')
                 continue
             scan_id = f'position-review-{coin}-{int(now)}'
             event('position_review_start', coin=coin, scan_id=scan_id)

@@ -25,6 +25,7 @@ import sys
 import json
 import time
 import logging
+import hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from clients.trade_policy import validate_command, valid_amount
 from clients.paper_account import PaperAccount, accounting
@@ -287,6 +288,33 @@ def get_real_balance() -> dict:
         return None
 
 
+def _valuation_quote(exchange, symbol):
+    """Gate tickers lack timestamps; use timestamped public order-book midpoint."""
+    from clients.exposure_policy import number, fresh_price
+    book = exchange.fetch_order_book(symbol, 5)
+    bid = number(book['bids'][0][0])
+    ask = number(book['asks'][0][0])
+    if bid <= 0 or ask < bid or ask/bid > number('1.02'):
+        raise ValueError('invalid_or_wide_book')
+    quote = {'last':str((bid+ask)/2), 'ask':str(ask), 'timestamp':book.get('timestamp')}
+    fresh_price(quote)
+    return quote
+
+
+def calculate_total_net_worth(balance=None, exchange=None):
+    """Read-only spot NAV, including locked balances and dust. Raises if incomplete."""
+    from clients.exposure_policy import calculate_total_net_worth as calculate
+    exchange = exchange or _get_exchange()
+    if exchange is None:
+        raise ValueError('valuation_exchange_unavailable')
+    balance = exchange.fetch_balance() if balance is None else balance
+    started = time.time()
+    result = calculate(balance, lambda pair: _valuation_quote(exchange,pair))
+    if time.time()-started > 15:
+        raise ValueError('valuation_snapshot_too_slow')
+    return result
+
+
 def get_real_holdings() -> dict:
     """
     获取真实持仓明细（各币种可用数量）。
@@ -404,7 +432,34 @@ def _check_symbol(symbol: str) -> str:
 
 # ==================== 主入口 ====================
 
-def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, current_qty=0.0):
+def client_oid_for(request_id):
+    """从 request_id 派生 Gate.io text 幂等键：t- + sha256 前 24 位 = 26 字节（<=28）。"""
+    if not request_id:
+        return None
+    return "t-" + hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:24]
+
+
+def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, current_qty=0.0,
+                client_oid=None):
+    from clients.execution_lane import execution_lane
+    import sqlite3
+    try:
+        with execution_lane() as lane:
+            if lane is None:
+                return {"success": False, "exchange_confirmed": False,
+                        "status": "executor_busy", "detail": "账户执行通道忙，未提交订单"}
+            if lane.blocked() or lane.existing_committee_pending(client_oid):
+                return {"success": False, "exchange_confirmed": False,
+                        "status": "allocation_pending", "detail": "执行层有待核实订单，禁止重发；未提交新订单"}
+            return _live_trade_locked(ccxt_symbol, coin_name, action, amount_usdt,
+                                      percentage, current_qty, client_oid, lane)
+    except (OSError, ValueError, sqlite3.Error):
+        return {"success": False, "exchange_confirmed": False,
+                "status": "allocation_state_unavailable", "detail": "执行状态不可用，未提交新订单"}
+
+
+def _live_trade_locked(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, current_qty=0.0,
+                client_oid=None, lane=None):
     """真实市价单 + 成交回读。仅在 DRY_RUN=False 时调用。
 
     约定：success=True 只代表"交易所已接受订单"；是否真成交看 exchange_confirmed。
@@ -413,6 +468,7 @@ def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, curre
     out = {"success": False, "detail": "", "status": "live_failed",
            "fill_price": 0.0, "quantity": 0.0, "pnl_pct": 0.0, "pnl_usdt": 0.0,
            "order_id": None, "exchange_confirmed": False}
+    submission_attempted = False
     try:
         import ccxt
     except ImportError:
@@ -438,21 +494,67 @@ def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, curre
         price = float(ticker["last"])
 
         if side == "buy":
-            _bal0 = exchange.fetch_balance()
-            free_usdt = float(((_bal0.get("free") or {}).get("USDT") or 0))
-            if free_usdt <= 0:
-                out["status"] = "no_usdt"
-                out["detail"] = "交易所可用 USDT 为 0，无法买入"
-                return out
-            if percentage > 0:
-                amount_usdt = round(free_usdt * percentage / 100.0, 2)
-                _logger.info("[实盘] 可用 USDT=%.2f，BUY %d%% -> %.2f USDT"
-                             % (free_usdt, percentage, amount_usdt))
-            min_cost = float((market.get("limits", {}).get("cost", {}) or {}).get("min") or 0)
-            if amount_usdt < min_cost:
-                out["status"] = "below_min_cost"
-                out["detail"] = (f"下单金额 {amount_usdt:.2f} USDT 低于交易所最小 "
-                                 f"{min_cost:g} USDT，已取消（未下单）")
+            from clients.exposure_policy import (calculate_total_net_worth, buy_budget,
+                                                  fresh_price, number, FEE_RESERVE_FLOOR)
+            try:
+                started = time.time()
+                # Refresh market limits inside the account lock; never use a hardcoded minimum.
+                exchange.load_markets(True)
+                market = exchange.markets[ccxt_symbol]
+                if exchange.fetch_open_orders():
+                    out.update(status='open_orders_pending', detail='账户存在挂单，未提交新增买单')
+                    return out
+                _bal0 = exchange.fetch_balance()
+                ticker = _valuation_quote(exchange, ccxt_symbol)
+                tickers = {ccxt_symbol: ticker}
+                def ticker_for(pair):
+                    if pair not in tickers:
+                        tickers[pair] = _valuation_quote(exchange,pair)
+                    return tickers[pair]
+                snapshot = calculate_total_net_worth(_bal0, ticker_for)
+                fresh_price(ticker)
+                price = float(ticker["ask"])
+                free_usdt = snapshot['free_usdt']
+                if free_usdt <= 0:
+                    out.update(status='no_usdt', detail='可用 USDT 为零，未提交订单')
+                    return out
+                # Query rate if supported; budget an explicit 0.5% floor if unavailable.
+                fee_source = 'conservative_reserve_0.5pct'
+                fee_rate = FEE_RESERVE_FLOOR
+                try:
+                    fee_info = exchange.fetch_trading_fee(ccxt_symbol)
+                    if fee_info.get('percentage') is not False:
+                        fee_rate = max(number(fee_info['taker']), FEE_RESERVE_FLOOR)
+                        fee_source = 'max(account_taker,0.5pct_reserve)'
+                except Exception:
+                    pass
+                requested = free_usdt * number(percentage)/100 if percentage > 0 else number(amount_usdt)
+                budget, status = buy_budget(snapshot, ccxt_symbol.split('/')[0], requested, fee_rate)
+                if status != 'ok':
+                    out.update(status=status, detail='新增买入达到单币60%或可用现金20%限制，未提交订单')
+                    return out
+                # Quote amount precision must round DOWN, never expand the AI's request.
+                amount_usdt = float(exchange.cost_to_precision(ccxt_symbol, float(budget)))
+                if number(amount_usdt) > budget:
+                    raise ValueError('cost_precision_rounded_up')
+                limits = market.get('limits') or {}
+                min_cost = number((limits.get('cost') or {}).get('min'))
+                min_amount = number((limits.get('amount') or {}).get('min'))
+                if min_cost <= 0 or min_amount <= 0:
+                    raise ValueError('market_limits_unavailable')
+                if amount_usdt <= 0 or number(amount_usdt) < min_cost:
+                    out.update(status='below_min_cost', detail='风控截断后低于当前交易对最低金额，未提交订单')
+                    return out
+                if time.time()-started > 15:
+                    raise ValueError('valuation_snapshot_too_slow')
+                # Recheck every timestamp at the final budgeting instant.
+                for item in tickers.values(): fresh_price(item)
+                out['allocation'] = {'nav_usdt': str(snapshot['total']),
+                    'coin_value_usdt': str(snapshot['asset_values'].get(ccxt_symbol.split('/')[0],0)),
+                    'quote_budget': str(amount_usdt), 'fee_reserve_rate': str(fee_rate),
+                    'fee_source': fee_source, 'max_coin_pct':60, 'min_free_cash_pct':20}
+            except Exception as exc:
+                out.update(status='valuation_unavailable', detail='估值/费率预算/门槛不可用：'+type(exc).__name__+'；未提交订单')
                 return out
             raw_amount = amount_usdt / price
         else:
@@ -481,12 +583,31 @@ def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, curre
                                  f"低于交易所最低数量 {min_amount:g} 或金额 {min_cost:g} USDT，未提交订单")
                 return out
 
+        if side == "buy":
+            if raw_amount < float(min_amount) or raw_amount * price < float(min_cost):
+                out.update(status='below_min_cost', detail='精度处理后低于交易对数量或金额门槛，未提交订单')
+                return out
+            amount_usdt = float(exchange.cost_to_precision(ccxt_symbol, raw_amount * price))
+            if amount_usdt < float(min_cost) or number(amount_usdt) > budget:
+                out.update(status='below_min_cost', detail='最终报价金额不合规，未提交订单')
+                return out
         params = {"symbol": ccxt_symbol, "side": side, "amount": raw_amount}
         if side == "buy":
-            params["price"] = price   # Gate 市价买单必须带 price，否则 ccxt 直接抛 InvalidOrder
+            params["price"] = price
+            # Gate native market BUY amount is quote currency. CCXT's explicit
+            # cost param prevents a second base-to-quote conversion.
+            params["params"] = {"cost": amount_usdt}
+        if client_oid:
+            params.setdefault("params", {})["text"] = client_oid   # 幂等键：事后可按 text 反查交易所订单
+        if lane is not None and not lane.prepare(ccxt_symbol, client_oid):
+            out.update(status='duplicate_submission', detail='执行幂等键已存在，未提交新订单')
+            return out
+        submission_attempted = True
         order = exchange.create_market_order(**params)
         oid = order.get("id")
+        if lane is not None: lane.attach(oid)
         out.update({"success": True, "status": "submitted", "order_id": oid,
+                    "client_oid": client_oid,
                     "detail": f"已提交市价单 {side} {raw_amount} {coin_name}（订单 {oid}）"})
 
         for _ in range(5):
@@ -497,6 +618,11 @@ def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, curre
                 continue
             filled = float(o.get("filled") or 0)
             if filled > 0:
+                # Partial/open orders keep the persistent execution latch.
+                if o.get('status') not in ('closed', 'canceled', 'expired', 'rejected'):
+                    time.sleep(1)
+                    continue
+                if lane is not None: lane.terminal()
                 cost = float(o.get("cost") or 0)
                 avg = float(o.get("average") or (cost / filled if filled else 0)) or price
                 out.update({"quantity": filled, "fill_price": avg,
@@ -505,6 +631,7 @@ def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, curre
                                        f"金额约 {cost:.2f} USDT（订单 {oid}）")})
                 return out
             if o.get("status") in ("canceled", "expired", "rejected"):
+                if lane is not None: lane.terminal()
                 out.update({"success": False, "status": "rejected",
                             "detail": f"交易所返回状态 {o.get('status')}（订单 {oid}）"})
                 return out
@@ -515,8 +642,9 @@ def _live_trade(ccxt_symbol, coin_name, action, amount_usdt, percentage=0, curre
         return out
     except Exception as e:
         out["success"] = False
-        out["status"] = "exception"
-        out["detail"] = f"实盘下单异常: {type(e).__name__}: {e}"
+        out["status"] = "exception" if submission_attempted else "pre_submission_failed"
+        out["detail"] = "实盘提交异常（结果待核实）" if submission_attempted else "提交前校验失败（未下单）"
+        out["detail"] += ": " + type(e).__name__
         return out
 
 
@@ -620,7 +748,8 @@ def execute_order(symbol: str, action: str, amount_usdt: float = 10,
 
     # ── 实盘：真实市价单 ──
     live_result = _live_trade(ccxt_symbol, coin_name, action, amount_usdt,
-                              percentage=percentage, current_qty=current_qty)
+                              percentage=percentage, current_qty=current_qty,
+                              client_oid=client_oid_for(request_id))
     result.update(live_result)
     return result
 
@@ -693,7 +822,7 @@ def _generate_live_summary(now_str: str) -> str:
 
 def generate_ledger_summary():
     if DRY_RUN is not True:
-        return "实盘执行未开放；账户信息请使用只读核实工具。净值变化不等于已实现收益。"
+        return _generate_live_summary(_bjt_now_str())   # 2026-11-03：原来忘了调用实盘摘要，现恢复
     account = _paper_account()
     snapshot = account.snapshot()
     quotes = _quotes_for(account)

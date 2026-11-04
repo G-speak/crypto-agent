@@ -111,7 +111,7 @@ AGENT_PROMPTS = {
 1. 审视多头和空头的辩论。
 2. 结合当前的【真实持仓情况】（空仓还是满仓）。
 3. 做出最终的裁决。
-铁律：如果你当前是【空仓】，绝对不允许给出 SELL 建议；如果当前【已有持仓】，绝对不允许给出 BUY 建议。矛盾或不确定时输出 HOLD。
+铁律：空仓或不可交易灰尘绝对不允许 SELL。已有持仓允许在买点明确时继续 BUY（分批加仓），结合持仓成本、浮盈亏、仓位占比与可用 USDT 决策，仓位越重加仓越保守，不得在下跌未企稳时盲目补仓。新增 BUY 受单币60%上限和全账户20%可用现金保留约束；这些限制不触发强制 SELL。BUY percentage 仍指可用 USDT 的10%-50%，最终金额可能下调。矛盾或不确定时 HOLD。
 4. 【抗磨损铁律】：真实交易所存在单边 0.1% 的手续费。如果判断上涨空间不足 3%，严禁给出 BUY 建议，宁可错过绝不做无效交易！
 5. 【仓位管理】：按【当前状态】里给出的账户可用资金计算仓位。单次 BUY 的建仓比例 (percentage) 为可用资金的 10%-50%，且单笔金额不低于 5 USDT（交易所最小下单门槛）；不得以“凑门槛”为由放大到高仓位。
 6. 【实盘风控红线】：严禁满仓梭哈，任何情况下 BUY 的 percentage 不得超过 50。低确定性轻仓（10%-15%）、中等确定性（20%-35%）、高确定性重仓（40%-50%）。不确定时宁可轻仓或 HOLD，保留现金。
@@ -455,19 +455,30 @@ def _clip(t, n: int) -> str:
 
 
 # ====== 4. 主调用入口 ======
-def run_committee(coin_name, symbol, radar_reason="", scan_id=None, review_only=False, trigger="radar"):
+def run_committee(coin_name, symbol, radar_reason="", scan_id=None, review_only=False, trigger="radar",
+                  outcome=None):
+    """返回值仍是 bool（兼容旧调用）；原因码写进 outcome，供上层区分报警文案。"""
+    def note(code, detail=""):
+        if outcome is not None:
+            outcome["reason"] = code
+            outcome["detail"] = str(detail)[:300]
+
     try:
         if os.environ.get("POSITION_REVIEW_ENABLED", "0") == "1":
             from clients.committee_coordination import coordinated_run
             try:
                 return coordinated_run(coin_name, symbol, radar_reason, scan_id, review_only,
-                                       trigger, _run_committee, _ev)
+                                       trigger, _run_committee, _ev, outcome=outcome)
             except (ValueError, OSError, RuntimeError):
                 raise CommitteeUnavailable("委员会协调状态不可用") from None
-        return _run_committee(coin_name, symbol, radar_reason, scan_id, review_only=review_only)
-    except CommitteeUnavailable:
-        _ev("committee_blocked", scan_id=scan_id, coin=coin_name,
-            reason="必需数据、角色或交易指令校验失败，未发送新订单")
+        ok = _run_committee(coin_name, symbol, radar_reason, scan_id, review_only=review_only)
+        note("ok" if ok is True else ("data_unavailable" if ok is None else "incomplete"))
+        return ok
+    except CommitteeUnavailable as exc:
+        msg = str(exc)
+        code = "ai_failure" if msg.startswith("必需角色失败") else "committee_blocked"
+        _ev("committee_blocked", scan_id=scan_id, coin=coin_name, reason=msg[:200], code=code)
+        note(code, msg)
         return False
 
 

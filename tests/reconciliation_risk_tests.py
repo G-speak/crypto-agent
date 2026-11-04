@@ -135,13 +135,14 @@ class PaperRiskTests(unittest.TestCase):
         return self.p.place('BTC/USDT','BUY',pct,self.quotes(price),key=key,now=self.now)
 
     def test_cash_is_not_mark_to_market_and_fifo_partial_sell(self):
-        self.buy();self.buy(pct=20,price=110,key='buy2')
-        snapshot=self.p.snapshot();self.assertAlmostEqual(float(snapshot['cash']),400,places=5)
+        # Keep this FIFO fixture below the new 60% concentration cap.
+        self.buy();self.buy(pct=10,price=110,key='buy2')
+        snapshot=self.p.snapshot();self.assertAlmostEqual(float(snapshot['cash']),450,places=5)
         # FIFO against first lot; no last-buy price and no multiplication by full buy quantity.
         sold=self.p.place('BTC/USDT','SELL',30,self.quotes(110),key='sell',now=self.now)
         self.assertTrue(sold['success'])
         self.assertAlmostEqual(sold['pnl_usdt'],sold['quantity']*10,places=5)
-        expected=D('400')+D(str(sold['quantity']))*110
+        expected=D('450')+D(str(sold['quantity']))*110
         self.assertAlmostEqual(float(self.p.snapshot()['cash']),float(expected),places=5)
 
     def test_fee_and_slippage_reduce_roundtrip_net(self):

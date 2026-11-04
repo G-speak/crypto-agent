@@ -3,3 +3,4 @@ Flask>=3.1,<4
 cryptography>=45,<49
 numpy>=2.2,<3
 matplotlib>=3.10,<4
+ccxt==4.5.59

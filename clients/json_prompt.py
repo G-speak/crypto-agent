@@ -55,10 +55,10 @@ def build_json_prompt(data: dict, coin_name: str, news_text: str = "",
 
 【决策规则（铁律优先）】
 - 当前该币种持仓状态：{holdings_text}
-- 铁律：如果你当前是空仓，绝对不允许给出 SELL 建议，只能 BUY 或 HOLD。
-- 铁律：如果你当前有持仓，绝对不允许给出 BUY 建议（不能再加仓），只能 SELL 或 HOLD。
-- 只有当技术面出现强支撑（如超卖且触底）且空仓时，才可判定为 BUY。
-- 只有当技术面破位或超买且有持仓时，才可判定为 SELL。
+- 铁律：如果你当前是空仓或不可交易灰尘，绝对不允许给出 SELL 建议，只能 BUY 或 HOLD。
+- 允许分批建仓与加仓：即使已有持仓，技术面出现明确支撑、超卖反弹或突破买点时仍可判定 BUY；不能仅因下跌而补仓。持仓成本、浮盈亏及仓位占比作为风险参考。
+- BUY 还须有可用资金并符合单币60%上限与账户20%可用现金保留；估值未知由执行器拒绝买入。
+- 只有当技术面破位或超买且有可交易持仓（非灰尘）时，才可判定为 SELL。
 - 任何信号不明确、指标冲突或铁律矛盾时，一律判定为 HOLD。
 
 请输出如下 JSON 格式：
@@ -105,97 +105,11 @@ def parse_json_reply(reply: str) -> dict:
     return {"action": "HOLD", "reason": "AI 输出解析失败，默认持有"}
 
 
-# ── 免费模型全局冷却（与 crypto_monitor.py 共用）──
-try:
-    from crypto_monitor import _FREE_MODEL_BLOCKED_UNTIL
-except ImportError:
-    _FREE_MODEL_BLOCKED_UNTIL = 0.0
-
-
 def ask_ai_json(prompt: str, model: str = "auto") -> dict:
-    """
-    调用 AI（双平台动态路由 + 多模型轮询 + 每模型3次重试 + 免费冷却），
-    返回解析后的 {"action": ..., "reason": ...}。
-    """
-    import requests, json, os, time
-    global _FREE_MODEL_BLOCKED_UNTIL
-
-    from wechat_config import AI_API_KEY, YUNWU_API_KEY
-    APP_CODE = os.environ.get("AIHUBMIX_APP_CODE", "")
-    _log = print
-
-    # MODEL_POOL：OpenLux 付费优先（2026-10-11 更新：v3.2 / r1 已被服务商下线，改用 v4 系列）
-    JSON_MODEL_POOL = [
-        "deepseek-v4-flash",    # [OpenLux付费] 主力（实测 200）
-        "deepseek-v4.1-flash",  # [OpenLux付费] 备选（更便宜）
-        "deepseek-v3-1",        # [OpenLux付费] 兜底
-    ]
-
-    if model == "auto":
-        candidate_models = JSON_MODEL_POOL
-    else:
-        candidate_models = [model]
-
-    # 检查免费模型冷却期
-    if time.time() < _FREE_MODEL_BLOCKED_UNTIL:
-        candidate_models = [m for m in candidate_models if "free" not in m.lower()]
-        _log(f"[ask_ai_json] 免费模型冷却至 {time.strftime('%H:%M', time.localtime(_FREE_MODEL_BLOCKED_UNTIL))}，跳过免费模型")
-
-    free_all_429 = True
-
-    for use_model in candidate_models:
-        if "free" in use_model.lower():
-            api_url = "https://api.aihubmix.com/v1/chat/completions"
-            api_key = AI_API_KEY
-        else:
-            api_url = "https://api.openlux.ai/v1/chat/completions"
-            api_key = YUNWU_API_KEY
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        if "aihubmix" in api_url and APP_CODE:
-            headers["APP-Code"] = APP_CODE
-
-        payload = {
-            "model": use_model,
-            "messages": [
-                {"role": "system", "content": JSON_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 500,   # 2026-10-15: 300 太小易被截断导致 JSON 解析失败
-        }
-
-        for attempt in range(1, 4):
-            try:
-                resp = requests.post(api_url, headers=headers, json=payload, timeout=60)
-                resp.raise_for_status()
-                reply = resp.json()["choices"][0]["message"]["content"]
-                if "free" in use_model.lower():
-                    free_all_429 = False
-                return parse_json_reply(reply)
-            except requests.exceptions.HTTPError as e:
-                if resp is not None and resp.status_code == 429 and attempt < 3:
-                    _log(f"[ask_ai_json] 模型 {use_model} 429限流，等待3秒后第{attempt+1}次重试...")
-                    time.sleep(3)
-                    continue
-                _log(f"[ask_ai_json] 模型 {use_model} HTTP错误: {e}，切换至下一模型")
-                break
-            except Exception as e:
-                _log(f"[ask_ai_json] 模型 {use_model} 请求异常: {e}")
-                if attempt < 3:
-                    time.sleep(3)
-                    continue
-                break
-
-    # 如果所有免费模型都 429，更新冷却（与 crypto_monitor 共享变量）
-    if free_all_429 and any("free" in m.lower() for m in candidate_models):
-        _FREE_MODEL_BLOCKED_UNTIL = time.time() + 3 * 3600
-        _log(f"[ask_ai_json] 所有免费模型均429，冻结免费模型至 {time.strftime('%H:%M', time.localtime(_FREE_MODEL_BLOCKED_UNTIL))}")
-
-    return {"action": "HOLD", "reason": "所有模型调用失败"}
+    """Bounded candidate attempts; no ping, no free channel, no same-model retry."""
+    from wechat_config import YUNWU_API_KEY
+    from clients.ai_initial_routing import request_decision
+    return request_decision(prompt, JSON_SYSTEM_PROMPT, YUNWU_API_KEY, model=model)
 
 
 # ── 本地自测 ──

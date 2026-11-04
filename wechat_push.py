@@ -73,6 +73,8 @@ def push_analysis(analysis_texts, chart_paths, touser=TOUSER):
         print(f"✅", end=" ")
     except Exception as e:
         print(f"❌ Ai消息推送失败: {e}", end=" ")
+        print()
+        return False
 
     print()
     return True

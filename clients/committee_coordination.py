@@ -19,7 +19,9 @@ from clients.position_review import ReviewSchedule
 _LOCK = threading.Lock()
 ACCOUNT = 'committee-service'
 NO_SUBMISSION = {'rejected_input', 'holdings_unavailable', 'skipped_no_holdings',
-                 'no_usdt', 'below_min_cost', 'zero_amount'}
+                 'no_usdt', 'below_min_cost', 'zero_amount', 'valuation_unavailable',
+                 'max_exposure_reached', 'cash_reserve_reached', 'executor_busy',
+                 'allocation_pending', 'open_orders_pending', 'pre_submission_failed', 'allocation_state_unavailable', 'duplicate_submission'}
 
 
 def readonly_reader():
@@ -54,7 +56,10 @@ class ExecutionGuard:
         with database(self.journal.path) as db:
             if db.execute('SELECT 1 FROM intents WHERE key=?', (request_id,)).fetchone():
                 raise ValueError('duplicate_intent')
-        self.journal.prepare(request_id, ACCOUNT, symbol, action.lower(), {'percentage': percentage})
+        from clients.gateio_trade import client_oid_for
+        self.client_oid = client_oid_for(request_id)
+        self.journal.prepare(request_id, ACCOUNT, symbol, action.lower(), {'percentage': percentage},
+                             client_oid=self.client_oid)
 
     def observe(self, result):
         result = dict(result or {})
@@ -115,15 +120,20 @@ def committee_lane(path):
         _LOCK.release()
 
 
-def coordinated_run(coin, symbol, reason, scan_id, review_only, trigger, runner, event):
+def coordinated_run(coin, symbol, reason, scan_id, review_only, trigger, runner, event, outcome=None):
     now = time.time()
     state = Path(os.path.expanduser('~/.hermes/state'))
     with committee_lane(state / 'committee_orders.sqlite3') as guard:
         if guard is None:
             event('committee_skipped', coin=coin, reason='committee_busy', trigger=trigger)
+            if outcome is not None:
+                outcome['reason'] = 'committee_busy'
             return False
         if guard.blocked():
             event('committee_skipped', coin=coin, reason='unresolved_order', trigger=trigger)
+            if outcome is not None:
+                outcome['reason'] = 'unresolved_order'
+                outcome['detail'] = '存在未决订单，交易安全锁生效'
             return False
         # Any committee attempt postpones the next periodic review by four hours.
         # A fresh radar may re-evaluate after five minutes, avoiding an immediate
@@ -132,6 +142,9 @@ def coordinated_run(coin, symbol, reason, scan_id, review_only, trigger, runner,
                                   interval=14400 if trigger == 'position_review' else 300)
         if not schedule.claim(coin, now):
             event('committee_skipped', coin=coin, reason='shared_cooldown', trigger=trigger)
+            if outcome is not None:
+                outcome['reason'] = 'shared_cooldown'
+                outcome['detail'] = '同一币冷却期内'
             return False
         scan_id = scan_id or ('review-' + uuid.uuid4().hex[:16])
         event('committee_dispatch', coin=coin, scan_id=scan_id, trigger=trigger,
@@ -141,8 +154,11 @@ def coordinated_run(coin, symbol, reason, scan_id, review_only, trigger, runner,
         # tracking is attached only when actual execution is requested.
         execution_guard = guard if not trade.DRY_RUN and not review_only else None
         try:
-            return runner(coin, symbol, reason, scan_id, review_only=review_only,
-                          execution_guard=execution_guard)
+            ok = runner(coin, symbol, reason, scan_id, review_only=review_only,
+                        execution_guard=execution_guard)
         finally:
             # A slow model call must not consume the post-decision cooldown.
             schedule.completed(coin, time.time())
+        if outcome is not None and 'reason' not in outcome:
+            outcome['reason'] = 'ok' if ok is True else ('data_unavailable' if ok is None else 'incomplete')
+        return ok

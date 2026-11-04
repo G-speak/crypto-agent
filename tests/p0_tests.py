@@ -257,7 +257,7 @@ for n in tree.body:
         if nm in ("AGENT_PROMPTS", "ROLE_MODELS", "AGENT_MAX_TOKENS", "AGENT_MODEL_CHAIN", "MAX_BUY_PCT"):
             vals[nm] = ast.literal_eval(n.value)
 h = hashlib.md5(json.dumps(vals["AGENT_PROMPTS"], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-check("T6a 七个提示词逐字未变", h == "5184c14083e2473835a53a5c2794eca6", "md5=" + h)
+check("T6a 提示词符合已授权分批加仓版本", h == "87c033abe60a49bcd099cdad323f0a89", "md5=" + h)
 check("T6b MAX_BUY_PCT 未变", vals["MAX_BUY_PCT"] == 50, str(vals["MAX_BUY_PCT"]))
 check("T6c 角色→模型绑定未变",
       vals["ROLE_MODELS"] == {"tech_analyst": "gpt-5.6-luna", "fund_analyst": "gpt-5.6-luna",

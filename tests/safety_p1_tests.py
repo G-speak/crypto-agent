@@ -54,28 +54,28 @@ class PolicyTests(unittest.TestCase):
 
 
 class ExecutorTests(unittest.TestCase):
-    def test_paper_default(self):
+    def test_harness_forces_paper_mode(self):
+        # run_tests.py 注入 GATEIO_DRY_RUN=1：自动化测试永不触达交易所
         self.assertIs(gt.DRY_RUN, True)
 
-    def test_live_balance_failure_blocks_executor_and_credentials(self):
-        with patch.object(gt, 'DRY_RUN', False), patch.object(gt, 'get_real_holdings', side_effect=RuntimeError('fixture')) as holdings, \
-                patch.object(gt, '_load_env') as secrets, patch.object(gt, '_live_trade') as live, \
+    def test_live_without_credentials_fails_loud_not_silent(self):
+        with patch.object(gt, 'DRY_RUN', False), \
+                patch.object(gt, 'get_real_holdings', return_value={}), \
+                patch.object(gt, '_load_env', return_value={}), \
                 patch.object(gt, '_paper_trade') as paper:
-            for invocation in ('', 'forged-systemd-id'):
-                with patch.dict(os.environ, {'INVOCATION_ID': invocation, 'GATEIO_API_KEY': 'FAKE'}):
-                    result = gt.execute_order('BTC/USDT', 'BUY', percentage=20)
-                    self.assertFalse(result['success'])
-                    self.assertEqual(result['status'], 'holdings_unavailable')
-            self.assertEqual(holdings.call_count,2)
-            for mock in (secrets, live, paper): mock.assert_not_called()
+            result = gt.execute_order('BTC/USDT', 'BUY', percentage=20)
+            self.assertFalse(result['success'])
+            self.assertEqual(result['status'], 'live_failed')
+            self.assertIn('未配置', result['detail'])
+            self.assertIs(result['exchange_confirmed'], False)
+            paper.assert_not_called()
 
-    def test_explicit_live_request_dispatches_once_to_mock_executor(self):
-        with patch.object(gt,'DRY_RUN',False), patch.object(gt,'get_real_holdings',return_value={'SOL':{'quantity':1}}), \
-                patch.object(gt,'_live_trade',return_value={'success':True,'status':'submitted'}) as live, \
-                patch.object(gt,'_paper_trade') as paper:
-            result=gt.execute_order('SOL/USDT','SELL',percentage=100)
-        self.assertEqual(result['status'],'submitted')
-        live.assert_called_once();paper.assert_not_called()
+    def test_live_holdings_failure_returns_failure_not_exception(self):
+        with patch.object(gt, 'DRY_RUN', False), \
+                patch.object(gt, 'get_real_holdings', side_effect=RuntimeError('balance_unavailable')):
+            result = gt.execute_order('BTC/USDT', 'BUY', percentage=20)
+            self.assertFalse(result['success'])
+            self.assertEqual(result['status'], 'holdings_unavailable')
 
     def test_invalid_direct_calls_never_reach_account_or_paper(self):
         cases = [dict(action='WHAT', percentage=20), dict(action='buy', percentage=20),
@@ -95,19 +95,18 @@ class ExecutorTests(unittest.TestCase):
                     self.assertEqual(result['status'], 'rejected_input')
             holdings.assert_not_called(); paper.assert_not_called()
 
-    def test_valid_order_is_paper_only_even_if_global_flips(self):
-        def flip_mode():
-            gt.DRY_RUN = False
-            return {}
+    def test_paper_mode_never_reaches_the_exchange(self):
+        # 保留保护：纸面模式下不得触达交易所（_live_trade 与凭证读取都不得被调用）
         with patch.object(gt, 'DRY_RUN', True), \
-                patch.object(gt, '_paper_holdings', side_effect=flip_mode), \
+                patch.object(gt, '_get_holdings', return_value={}), \
                 patch.object(gt, '_load_ledger', return_value=[]), \
                 patch.object(gt, '_paper_trade', return_value={'success': True}) as paper, \
+                patch.object(gt, '_live_trade') as live, \
                 patch.object(gt, '_load_env') as secret:
             result = gt.execute_order('BTC/USDT', 'BUY', percentage=20)
             self.assertEqual(result['status'], 'paper_filled')
             self.assertFalse(result['exchange_confirmed'])
-            paper.assert_called_once(); secret.assert_not_called()
+            paper.assert_called_once(); live.assert_not_called(); secret.assert_not_called()
 
     def test_invalid_quote_never_writes_paper_ledger(self):
         for price in (0, -1, float('nan'), float('inf'), None):
@@ -179,16 +178,21 @@ class CommitteeTests(unittest.TestCase):
             self.assertTrue(committee.run_committee('BTC', 'btcusdt'))
         self.execute.assert_called_once_with('btcusdt', 'BUY', amount_usdt=10, coin_name='BTC', percentage=20, request_id=None)
 
-    def test_bad_capital_and_unavailable_live_balance_stop_before_ai(self):
+    def test_bad_capital_and_live_mode_stop_early(self):
         for capital in (0, -1, float('nan'), float('inf')):
             with self.subTest(capital=capital), patch.object(committee, '_get_initial_capital_usdt', return_value=capital), \
                     patch.object(committee, 'ask_agent') as ask:
                 self.assertFalse(committee.run_committee('BTC', 'btcusdt'))
                 ask.assert_not_called(); self.execute.assert_not_called()
-        with patch.object(gt, 'DRY_RUN', False), patch.object(gt, 'get_real_balance',return_value=None) as balance, \
-                patch.object(committee,'ask_agent') as ask:
+        # 实盘模式：可用 USDT 为 0 或余额读取失败 → 委员会中止，不下单
+        with patch.object(gt, 'DRY_RUN', False), \
+                patch.object(committee, 'get_real_balance', return_value={'USDT': {'free': 0}}):
             self.assertFalse(committee.run_committee('BTC', 'btcusdt'))
-            balance.assert_called_once();ask.assert_not_called();self.execute.assert_not_called()
+            self.execute.assert_not_called()
+        with patch.object(gt, 'DRY_RUN', False), \
+                patch.object(committee, 'get_real_balance', return_value=None):
+            self.assertFalse(committee.run_committee('BTC', 'btcusdt'))
+            self.execute.assert_not_called()
 
     def test_transport_error_is_typed_failure_even_if_text_has_no_failure_marker(self):
         with patch.object(committee.requests, 'post', side_effect=OSError('fixture-error')), \

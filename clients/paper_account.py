@@ -120,12 +120,13 @@ class PaperAccount:
             config,rows,risk=self._read(db)
             return {**accounting(rows,config['initial']),'ledger':rows,'risk':risk}
 
-    def _fill(self, config, rows, symbol, action, percentage, price, reason):
+    def _fill(self, config, rows, symbol, action, percentage, price, reason, buy_limit=None):
         state=accounting(rows,config['initial'])
         fee_rate,slip=number(config['fee_rate']),number(config['slippage'])
         execution_price=price*(1+slip if action=='BUY' else 1-slip)
         if action=='BUY':
             budget=number(state['cash'])*percentage/100
+            if buy_limit is not None: budget=min(budget, buy_limit)
             qty=(budget/(execution_price*(1+fee_rate))).quantize(LOT,rounding=ROUND_DOWN)
         else:
             held=number(state['positions'].get(symbol,{}).get('quantity',0))
@@ -210,6 +211,28 @@ class PaperAccount:
                 if action=='BUY' and protection['blocked_new_risk']:
                     result={'success':False,'status':'paper_rejected','detail':'风险熔断或行情缺失，禁止加仓','exchange_confirmed':False}
                 elif action=='HOLD':result={'success':True,'status':'hold','exchange_confirmed':False}
+                elif action=='BUY':
+                    from clients.exposure_policy import buy_budget
+                    try:
+                        state=accounting(rows,config['initial'])
+                        values={p.split('/')[0]:number(pos['quantity'])*fresh_quote(
+                            quotes,p,now,config['policy']['max_quote_age'])
+                            for p,pos in state['positions'].items()}
+                        cash=number(state['cash'])
+                        snapshot={'total':cash+sum(values.values(),ZERO),
+                                  'free_usdt':cash,'asset_values':values}
+                        limit,status=buy_budget(snapshot,symbol.split('/')[0],cash*percentage/100,
+                                               config['fee_rate'])
+                        if status!='ok':
+                            result={'success':False,'status':status,'exchange_confirmed':False}
+                        else:
+                            # Model slippage as NAV loss as well as the configured fee.
+                            # A conservative mark-price allowance keeps post-fill exposure bounded.
+                            effective_fee=(1+number(config['fee_rate']))*(1+number(config['slippage']))-1
+                            limit,status=buy_budget(snapshot,symbol.split('/')[0],limit,effective_fee)
+                            result=self._fill(config,rows,symbol,action,percentage,price,'strategy',buy_limit=limit)
+                    except ValueError:
+                        result={'success':False,'status':'valuation_unavailable','exchange_confirmed':False}
                 else:result=self._fill(config,rows,symbol,action,percentage,price,'strategy')
             result['protection']=protection
             db.execute('UPDATE paper SET ledger=?,risk=? WHERE id=1',(canonical(rows),canonical(risk)))
